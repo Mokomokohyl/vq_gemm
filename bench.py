@@ -4,9 +4,9 @@ import os
 
 import vq_gemm_cuda
 
-M = 128
-K = 128
-N = 32
+M = 4096
+K = 4096
+N = 1024
 ENTRY = 256
 RATIO = 4
 
@@ -21,17 +21,19 @@ def vq_gemm_reference(input, w, codebook):
     # codebook: [N // 2, ENTRY, RATIO]
     K, N = w.shape
     M = input.shape[0]
+    RATIO = codebook.shape[2]
 
-    # 构造解码后的权重
-    w_decoded = torch.empty(K, N * RATIO, dtype=torch.float16, device=input.device)
-    for k in range(K):
-        for no in range(N // 32):
-            for ni in range(32):
-                row_idx = ni // 2 + no * 32
-                entry_idx = w[k, no * 32 + ni].item()
-                # 查码本，得到[RATIO]个half
-                w_decoded[k, (no * 32 + ni) * RATIO : (no * 32 + ni + 1) * RATIO] = codebook[row_idx, entry_idx]
-    # GEMM
+    # 计算每个列对应的分块行号
+    row_idx = torch.arange(N, device=w.device) // 2  # [N]
+    # 展开为 [K, N]，每个元素是分块行号
+    row_idx_expand = row_idx.unsqueeze(0).expand(K, N)
+    # entry_idx就是w本身
+    entry_idx = w.long()  # [K, N]
+
+    # 用高级索引一次性查码本，得到 [K, N, RATIO]
+    w_decoded = codebook[row_idx_expand, entry_idx]  # [K, N, RATIO]
+    # reshape为 [K, N * RATIO]
+    w_decoded = w_decoded.reshape(K, N * RATIO)
     output = torch.matmul(input, w_decoded)
     return output
 
