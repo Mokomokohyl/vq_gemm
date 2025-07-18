@@ -191,7 +191,6 @@ __device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook, half*
     #pragma unroll
     for (int i = 0; i < 16; i++) {
         *(uint32_t*)(&shmem[(threadIdx.x / 64) * (8 * 16 * 16) + (threadIdx.x % 4 * 16 + i) * 2 / 16 * (16 * 16) + (threadIdx.x / 4) % 16 * 16 + (threadIdx.x % 4 * 8 + i) * 2 % 16]) = *(uint32_t*)(&codebook_shmem[(local_id + i / 4) * 256 * RATIO + ((uint32_t) indices[i]) * RATIO]);
-        *(uint64_t*)(&shmem[(threadIdx.x / 64) * (8 * 16 * 16) + (threadIdx.x % 4) * (2 * 16 * 16) + (i / 4) * (16 * 16) + ((threadIdx.x % 64) / 4) * 16 + (i % 4) * 4]) = *(uint64_t*)(&codebook[(codebook_id + i / 2) * 256 * 4 + ((uint32_t) indices[i]) * 4]);
     }
 }
 

@@ -52,7 +52,7 @@ def main():
     if run_vq_gemm == 0:
         input = torch.randn(M, K, dtype=torch.float16, device=device)
         w = torch.randint(0, ENTRY, (K, N), dtype=torch.uint8, device=device)
-        codebook = torch.randn(N // 2, ENTRY, RATIO, dtype=torch.float16, device=device)
+        codebook = torch.randn(N // 4, ENTRY, RATIO, dtype=torch.float16, device=device)
         torch.cuda.synchronize()
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
