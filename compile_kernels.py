@@ -1,18 +1,35 @@
+import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-setup(
-    name='vq_gemm_cuda',
-    ext_modules=[
-        CUDAExtension(
-            'vq_gemm_cuda',
+kernels_to_compile_str = os.getenv('KERNELS', 'all')
+source = {
+    's1':   [
+                'bind.cpp',
+                './strategy_1/src.cu',
+            ], 
+    's2_128':
             [
                 'bind.cpp',
-                'vq_gemm.cu',
-            ],
-        )
-    ],
-    cmdclass={
-        'build_ext': BuildExtension.with_options(no_python_abi_suffix=True)
-    }
-)
+                './strategy_2/bsz128/src.cu',
+            ]
+}
+
+if kernels_to_compile_str == 'all':
+    kernels_to_compile = list(ALL_KERNELS.keys())
+else:
+    kernels_to_compile = [k.strip() for k in kernels_to_compile_str.split(',')]
+
+for kernels_to_compile_str in kernels_to_compile:
+    setup(
+        name=f'vq_gemm_cuda_{kernels_to_compile_str}',
+        ext_modules=[
+            CUDAExtension(
+                f'vq_gemm_cuda_{kernels_to_compile_str}',
+                source[kernels_to_compile_str]
+            )
+        ],
+        cmdclass={
+            'build_ext': BuildExtension.with_options(no_python_abi_suffix=True)
+        }
+    )

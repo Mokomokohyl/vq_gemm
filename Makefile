@@ -1,5 +1,6 @@
+KERNELS ?= all
 compile:
-	python compile_kernels.py build_ext --inplace
+	KERNELS=$(KERNELS) python compile_kernels.py build_ext --inplace
 run:
 	python bench.py > bench.log 2>&1
 try:
@@ -9,4 +10,4 @@ clean:
 	@rm -r build
 	@rm ./*.so
 
-.PHONY: run compile 
+.PHONY: run compile try clean

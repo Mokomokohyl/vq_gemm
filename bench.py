@@ -3,11 +3,14 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 
-import vq_gemm_cuda
+import vq_gemm_cuda_s1
+import vq_gemm_cuda_s2_128
 
 M = 4096
 K = 4096
 N = 2048
+run_vq_gemm = 1
+module = vq_gemm_cuda_s1
 ENTRY = 256
 RATIO = 2
 
@@ -47,9 +50,8 @@ def main():
     print(f"  Device: {device}")
     print("=" * 60)
 
-    run_vq_gemm = 0
     # 运行 VQ GEMM
-    if run_vq_gemm == 0:
+    if run_vq_gemm:
         input = torch.randn(M, K, dtype=torch.float16, device=device)
         w = torch.randint(0, ENTRY, (K, N), dtype=torch.uint8, device=device)
         codebook = torch.randn(N // 4, ENTRY, RATIO, dtype=torch.float16, device=device)
@@ -58,7 +60,7 @@ def main():
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
 
-        output_cuda = vq_gemm_cuda.e2e_gemm(input, w, codebook)
+        output_cuda = module.e2e_gemm(input, w, codebook)
 
         end_event.record()
         torch.cuda.synchronize()
@@ -66,7 +68,6 @@ def main():
 
         output_ref = vq_gemm_reference(input, w, codebook)
 
-        print(f"VQ GEMM finished in {elapsed_time:.3f} ms")
         print(f"VQ GEMM output shape:{output_cuda.shape}")
         print("Row mean of VQ GEMM output (Reference):", output_ref.mean(dim=1))
         print("Row mean of VQ GEMM output (CUDA):", output_cuda.mean(dim=1))
@@ -94,7 +95,7 @@ def main():
         outs_cuda = []
         outs_ref = []
         for i in range(5):
-            outs_cuda.append(vq_gemm_cuda.e2e_gemm(input, w, codebook).cpu())
+            outs_cuda.append(module.e2e_gemm(input, w, codebook).cpu())
             outs_ref.append(vq_gemm_reference(input, w, codebook).cpu())
 
         # 比较 CUDA 输出是否一致
