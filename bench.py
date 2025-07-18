@@ -29,7 +29,7 @@ def vq_gemm_reference(input, w, codebook):
     # 展开为 [K, N]，每个元素是分块行号
     row_idx_expand = row_idx.unsqueeze(0).expand(K, N)
     # entry_idx就是w本身
-    entry_idx = w.long()  # [K, N]
+    entry_idx = w.int()  # [K, N]
 
     # 用高级索引一次性查码本，得到 [K, N, RATIO]
     w_decoded = codebook[row_idx_expand, entry_idx]  # [K, N, RATIO]

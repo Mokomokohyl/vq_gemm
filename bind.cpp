@@ -5,5 +5,4 @@ torch::Tensor e2e_gemm_rq(torch::Tensor input, torch::Tensor w, torch::Tensor co
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("e2e_gemm", &e2e_gemm, "VQ GEMM");
-    m.def("e2e_gemm_rq", &e2e_gemm_rq, "VQ GEMM with residual quantization");
 }
