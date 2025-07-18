@@ -10,7 +10,12 @@ M = 4096
 K = 4096
 N = 2048
 run_vq_gemm = 1
-module = vq_gemm_cuda_s1
+kernel_to_use_str = os.getenv('KERNELS', 'all')
+module_dict = {
+    "s1": vq_gemm_cuda_s1,
+    "s2_128": vq_gemm_cuda_s2_128
+}
+module = module_dict[kernel_to_use_str]
 ENTRY = 256
 RATIO = 2
 
@@ -111,7 +116,7 @@ def main():
     else: # test gemm
         input = torch.randn(M, K, dtype=torch.float16, device=device)
         w = torch.rand(K, N, dtype=torch.float16, device=device)
-        output_cuda = vq_gemm_cuda.gemm(input, w)
+        output_cuda = module.gemm(input, w)
         output_ref = gemm_ref(input, w)
         diff = (output_cuda.float() - output_ref.float()).abs().mean().item()
         print(f"Mean absolute difference (CUDA vs Reference): {diff:.6f}")

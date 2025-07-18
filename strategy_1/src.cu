@@ -36,8 +36,16 @@
 
 #define CODEBOOK_BUFFERING 1
 
+// for dequant kernel
+#define DQ_BLOCK_SIZE 1024
+#define DQ_BLOCK_TILE_N 128
+#define DQ_BLOCK_TILE_KI 32
+
 // A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
 #define MAX_SHARED_MEMORY_USAGE (16384 + CODEBOOK_BUFFERING * (32768 / HOT))
+// uint8(1) -> half(2) + codebook
+#define DEQUANT_SHARED_MEMORY_USAGE (DQ_BLOCK_TILE_N * DQ_BLOCK_TILE_KI * RATIO * 2 + DQ_BLOCK_TILE_N / 4 * ENTRY * RATIO * 2)
+#define GEMM_SHARED_MEMORY_USAGE (BLOCK_TILE_M * BLOCK_TILE_K * 2 + BLOCK_TILE_K * RATIO * BLOCK_TILE_N * 2)
 __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     uint32_t addr;
     asm volatile(
@@ -164,22 +172,6 @@ __device__ void storeShmemC(half *C, half* shmem, int m, int n) {
     }
 }
 
-__device__ void storeC(half* C, uint32_t* frag, int m, int n) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
-    uint32_t lane_id = threadIdx.x % WARP_SIZE;
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            *(uint32_t*)(&C[(blockIdx.x * BLOCK_TILE_M + warp_id_x * WARP_TILE_M + i * MMA_TILE_M + (lane_id / 4) + 0) * n + (blockIdx.y * BLOCK_TILE_N + warp_id_y * WARP_TILE_N + j * MMA_TILE_N + (lane_id % 4) * 2)]) = 
-            *(uint32_t*)(&frag[(i * 8 + j) * 2 + 0]);
-            *(uint32_t*)(&C[(blockIdx.x * BLOCK_TILE_M + warp_id_x * WARP_TILE_M + i * MMA_TILE_M + (lane_id / 4) + 8) * n + (blockIdx.y * BLOCK_TILE_N + warp_id_y * WARP_TILE_N + j * MMA_TILE_N + (lane_id % 4) * 2)]) = 
-            *(uint32_t*)(&frag[(i * 8 + j) * 2 + 1]);
-        }
-    }
-}
-
 __global__ void gemm_kernel(
     half* _input,
     half* _w,
@@ -229,7 +221,7 @@ torch::Tensor gemm(
     cudaEventCreate(&st);
     cudaEventCreate(&ed);
 #endif
-    cudaFuncSetAttribute(e2e_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
+    // cudaFuncSetAttribute(e2e_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
     // Assuming M is padded to 128, pad at torch level.
 
     auto M = input.size(0);
@@ -276,6 +268,53 @@ torch::Tensor gemm(
     return o;
 }
 
+// 32 x 128 uint8, each thread dequant 4 uint8 per iter
+__global__ void dequant_kernel(
+    uint8_t* Bq, // [K, N]
+    half* _codebook, // [N / 4, ENTRY * RATIO]
+    half* B, // [K, N * RATIO]
+    int N, int K
+)
+{    
+    extern __shared__ uint8_t shmem[];
+    uint8_t indice[4];
+    half* B_buf = reinterpret_cast<half*>(shmem);
+    // codebook size: [DQ_BLOCK_TILE_N / 4 (=32) ,ENTRY * RATIO] (RATIO = 2)
+    half* codebook_buf = reinterpret_cast<half*>(shmem + DQ_BLOCK_TILE_KI * DQ_BLOCK_TILE_N * RATIO * 2);
+    uint32_t Brow = threadIdx.x % 32; // [0, 31]
+    uint32_t Bcol = (threadIdx.x / 32) * 4; // 4 * [0, 31]
+    // Load Codebook to shmem
+
+    uint32_t codebook_begin_row = blockIdx.x * DQ_BLOCK_TILE_N / 4;
+    // uint32_t iters_to_load = ((32 * ENTRY * RATIO) / 8) / BLOCK_SIZE; // = 2
+    uint32_t load_cols = (ENTRY * RATIO) / 8; // =64
+    uint32_t load_rows = DQ_BLOCK_SIZE / load_cols; // =16
+    *(int4*)(&codebook_buf[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
+    *(int4*)(&_codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
+
+    *(int4*)(&codebook_buf[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
+    *(int4*)(&_codebook[(codebook_begin_row + load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
+
+
+    half* codebook_line = codebook_buf + (Bcol / 4) * ENTRY * RATIO;
+    for (int i = 0; i < K / DQ_BLOCK_TILE_KI; i++) {
+
+        __syncthreads();
+        // Load Bq indice to reg.
+        *(uint32_t*)(&indice[0]) = *(uint32_t*)(&Bq[(i * DQ_BLOCK_TILE_KI + Brow) * N + blockIdx.x * DQ_BLOCK_TILE_N + Bcol]);
+
+        // dequant and write to Shmem
+        *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 0) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[0]) * RATIO]);
+        *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 1) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[1]) * RATIO]);
+        *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 2) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[2]) * RATIO]);
+        *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 3) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[3]) * RATIO]);
+
+        __syncthreads();
+        // write back to HBM
+        *(int4*)(&B[(i * DQ_BLOCK_TILE_KI + Brow) * N * RATIO + (blockIdx.x * DQ_BLOCK_TILE_N + Bcol) * RATIO]) = *(int4*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol) * RATIO]);
+    }
+}
+
 torch::Tensor e2e_gemm(
     torch::Tensor input,
     torch::Tensor w,
@@ -289,7 +328,7 @@ torch::Tensor e2e_gemm(
     cudaEventCreate(&st);
     cudaEventCreate(&ed);
 #endif
-    cudaFuncSetAttribute(e2e_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
+    // cudaFuncSetAttribute(e2e_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
     // Assuming M is padded to 128, pad at torch level.
 
     auto M = input.size(0);
@@ -304,22 +343,43 @@ torch::Tensor e2e_gemm(
     uint8_t* w_ptr = reinterpret_cast<uint8_t*>(w.data_ptr<uint8_t>());
     half* codebook_ptr = reinterpret_cast<half*>(codebook.data_ptr<at::Half>());
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
+    torch::Tensor B = torch::full({K, N * RATIO}, 0, options);
+    half* B_ptr = reinterpret_cast<half*>(B.data_ptr<at::Half>());
 
     dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
-    dim3 block(BLOCK_SIZE);
+    dim3 block(BLOCK_SIZE); // = 128
+    // For dequant kernel
+    dim3 dq_grid(N / DQ_BLOCK_TILE_N); // 4096 / 128 blocks. split on N
+    dim3 dq_block(DQ_BLOCK_SIZE); // = 1024
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
-        
+        dequant_kernel<<<dq_grid, dq_block, DEQUANT_SHARED_MEMORY_USAGE>>>(
+            w_ptr,
+            codebook_ptr,
+            B_ptr,
+            N, K
+        );
+        gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
+            input_ptr, 
+            B_ptr,
+            o_ptr,
+            M, N * RATIO, K
+        );
     }
     cudaEventRecord(st);
     for (int i = 0; i < iter; i++) {
 #endif
-        e2e_gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
-            input_ptr, 
+        dequant_kernel<<<dq_grid, dq_block, DEQUANT_SHARED_MEMORY_USAGE>>>(
             w_ptr,
-            codebook_ptr, 
+            codebook_ptr,
+            B_ptr,
+            N, K
+        );
+        gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
+            input_ptr, 
+            B_ptr,
             o_ptr,
-            M, N, K
+            M, N * RATIO, K
         );
 #if PROFILING == 1
     }
@@ -333,4 +393,3 @@ torch::Tensor e2e_gemm(
     return o;
 }
 
-__global__ void dequant_kernel()

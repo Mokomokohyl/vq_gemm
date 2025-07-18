@@ -16,7 +16,7 @@ source = {
 }
 
 if kernels_to_compile_str == 'all':
-    kernels_to_compile = list(ALL_KERNELS.keys())
+    kernels_to_compile = list(source.keys())
 else:
     kernels_to_compile = [k.strip() for k in kernels_to_compile_str.split(',')]
 
