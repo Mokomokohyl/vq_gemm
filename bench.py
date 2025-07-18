@@ -7,7 +7,7 @@ import vq_gemm_cuda
 
 M = 4096
 K = 4096
-N = 4096
+N = 1024
 ENTRY = 256
 RATIO = 4
 
@@ -49,7 +49,7 @@ def main():
 
     run_vq_gemm = 0
     # 运行 VQ GEMM
-    if run_vq_gemm == 1:
+    if run_vq_gemm == 0:
         input = torch.randn(M, K, dtype=torch.float16, device=device)
         w = torch.randint(0, ENTRY, (K, N), dtype=torch.uint8, device=device)
         codebook = torch.randn(N // 2, ENTRY, RATIO, dtype=torch.float16, device=device)
@@ -89,6 +89,7 @@ def main():
         plt.scatter(xs, ys, color='white', s=1)  # s=1为点大小，可适当调大
 
         plt.savefig(f"./figures/M={M}_N={N}_K={K}_err.png")
+        print(f"figure saved to ./figures/M={M}_N={N}_K={K}_err.png")
 
         outs_cuda = []
         outs_ref = []

@@ -250,6 +250,7 @@ __global__ void e2e_gemm_kernel(
                 }
             }
         }
+        __syncthreads();
     }
     storeC(_o, C_frags, M, N * RATIO);    
 }
@@ -334,7 +335,7 @@ __global__ void gemm_kernel(
     uint32_t C_frags[64] = {0};
 
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
-        loadShmemA(A1, _input, M, K, ko);
+        loadShmemA(A1, _input, M, K, ko); // cp.async
         loadShmemB(B1, _w, K, N, ko);
         asm volatile("cp.async.wait_all;\n"::);
         __syncthreads();
@@ -347,6 +348,7 @@ __global__ void gemm_kernel(
                 }
             }
         }
+        __syncthreads();
     }
     storeFragC_mma(C_buf, C_frags);
     __syncthreads();
