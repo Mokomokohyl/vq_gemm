@@ -7,7 +7,7 @@ import vq_gemm_cuda
 
 M = 4096
 K = 4096
-N = 1024
+N = 4096
 ENTRY = 256
 RATIO = 4
 
@@ -38,69 +38,108 @@ def vq_gemm_reference(input, w, codebook):
     output = torch.matmul(input, w_decoded)
     return output
 
+def gemm_ref(input, w):
+    return torch.matmul(input, w)
+
 def main():
     print(f"VQ GEMM Benchmark")
     print(f"  M={M}, K={K}, N={N}, ENTRY={ENTRY}, RATIO={RATIO}")
     print(f"  Device: {device}")
     print("=" * 60)
 
-    input = torch.randn(M, K, dtype=torch.float16, device=device)
-    w = torch.randint(0, ENTRY, (K, N), dtype=torch.uint8, device=device)
-    codebook = torch.randn(N // 2, ENTRY, RATIO, dtype=torch.float16, device=device)
-
+    run_vq_gemm = 0
     # 运行 VQ GEMM
-    torch.cuda.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
+    if run_vq_gemm == 1:
+        input = torch.randn(M, K, dtype=torch.float16, device=device)
+        w = torch.randint(0, ENTRY, (K, N), dtype=torch.uint8, device=device)
+        codebook = torch.randn(N // 2, ENTRY, RATIO, dtype=torch.float16, device=device)
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
 
-    output_cuda = vq_gemm_cuda.e2e_gemm(input, w, codebook)
+        output_cuda = vq_gemm_cuda.e2e_gemm(input, w, codebook)
 
-    end_event.record()
-    torch.cuda.synchronize()
-    elapsed_time = start_event.elapsed_time(end_event)
+        end_event.record()
+        torch.cuda.synchronize()
+        elapsed_time = start_event.elapsed_time(end_event)
 
-    output_ref = vq_gemm_reference(input, w, codebook)
+        output_ref = vq_gemm_reference(input, w, codebook)
 
-    print(f"VQ GEMM finished in {elapsed_time:.3f} ms")
-    print(f"VQ GEMM output shape:{output_cuda.shape}")
-    print("Row mean of VQ GEMM output (Reference):", output_ref.mean(dim=1))
-    print("Row mean of VQ GEMM output (CUDA):", output_cuda.mean(dim=1))
-    abs_diff = (output_cuda.float() - output_ref.float()).abs()
-    diff = (output_cuda.float() - output_ref.float()).abs().mean().item()
-    print(f"Mean absolute difference (CUDA vs Reference): {diff:.6f}")
-    max_val, max_idx = abs_diff.max(), abs_diff.argmax()
-    max_row, max_col = divmod(max_idx.item(), abs_diff.shape[1])
-    print(f"Max abs diff: {max_val.item()}, at ({max_row}, {max_col})")
+        print(f"VQ GEMM finished in {elapsed_time:.3f} ms")
+        print(f"VQ GEMM output shape:{output_cuda.shape}")
+        print("Row mean of VQ GEMM output (Reference):", output_ref.mean(dim=1))
+        print("Row mean of VQ GEMM output (CUDA):", output_cuda.mean(dim=1))
+        abs_diff = (output_cuda.float() - output_ref.float()).abs()
+        diff = (output_cuda.float() - output_ref.float()).abs().mean().item()
 
-    abs_diff_np = abs_diff.cpu().numpy()
-    plt.imshow(abs_diff_np, aspect='auto', cmap='viridis')
-    plt.colorbar()
-    plt.title("Absolute Error Heatmap")
+        print(f"Mean absolute difference (CUDA vs Reference): {diff:.6f}")
+        max_val, max_idx = abs_diff.max(), abs_diff.argmax()
+        max_row, max_col = divmod(max_idx.item(), abs_diff.shape[1])
+        print(f"Max abs diff: {max_val.item()}, at ({max_row}, {max_col})")
 
-    # 叠加误差>1的位置为白色点
-    mask = abs_diff_np > 1
-    ys, xs = np.where(mask)
-    plt.scatter(xs, ys, color='white', s=1)  # s=1为点大小，可适当调大
+        abs_diff_np = abs_diff.cpu().numpy()
+        plt.imshow(abs_diff_np, aspect='auto', cmap='viridis')
+        plt.colorbar()
+        plt.title("Absolute Error Heatmap")
 
-    plt.savefig(f"./figures/M={M}_N={N}_K={K}_err.png")
+        # 叠加误差>1的位置为白色点
+        mask = abs_diff_np > 1
+        ys, xs = np.where(mask)
+        plt.scatter(xs, ys, color='white', s=1)  # s=1为点大小，可适当调大
 
-    outs_cuda = []
-    outs_ref = []
-    for i in range(5):
-        outs_cuda.append(vq_gemm_cuda.e2e_gemm(input, w, codebook).cpu())
-        outs_ref.append(vq_gemm_reference(input, w, codebook).cpu())
+        plt.savefig(f"./figures/M={M}_N={N}_K={K}_err.png")
 
+        outs_cuda = []
+        outs_ref = []
+        for i in range(5):
+            outs_cuda.append(vq_gemm_cuda.e2e_gemm(input, w, codebook).cpu())
+            outs_ref.append(vq_gemm_reference(input, w, codebook).cpu())
 
-    # 比较 CUDA 输出是否一致
-    for i in range(1, 5):
-        same = torch.equal(outs_cuda[0], outs_cuda[i])
-        print(f"CUDA output run 0 vs {i}: {'一致' if same else '不一致'}")
+        # 比较 CUDA 输出是否一致
+        for i in range(1, 5):
+            same = torch.equal(outs_cuda[0], outs_cuda[i])
+            print(f"CUDA output run 0 vs {i}: {'一致' if same else '不一致'}")
 
-    # 比较 Reference 输出是否一致
-    for i in range(1, 5):
-        same = torch.equal(outs_ref[0], outs_ref[i])
-        print(f"Reference output run 0 vs {i}: {'一致' if same else '不一致'}")
+        # 比较 Reference 输出是否一致
+        for i in range(1, 5):
+            same = torch.equal(outs_ref[0], outs_ref[i])
+            print(f"Reference output run 0 vs {i}: {'一致' if same else '不一致'}")
+
+    else: # test gemm
+        input = torch.randn(M, K, dtype=torch.float16, device=device)
+        w = torch.rand(K, N, dtype=torch.float16, device=device)
+        output_cuda = vq_gemm_cuda.gemm(input, w)
+        output_ref = gemm_ref(input, w)
+        diff = (output_cuda.float() - output_ref.float()).abs().mean().item()
+        print(f"Mean absolute difference (CUDA vs Reference): {diff:.6f}")
+
+        abs_diff = (output_cuda.float() - output_ref.float()).abs()
+
+        print(f"Mean absolute difference (CUDA vs Reference): {diff:.6f}")
+        max_val, max_idx = abs_diff.max(), abs_diff.argmax()
+        max_row, max_col = divmod(max_idx.item(), abs_diff.shape[1])
+        print(f"Max abs diff: {max_val.item()}, at ({max_row}, {max_col})")
+
+        abs_diff_np = abs_diff.cpu().numpy()
+        plt.imshow(abs_diff_np, aspect='auto', cmap='viridis')
+        plt.colorbar()
+        plt.title("Absolute Error Heatmap")
+
+        # 叠加误差>1的位置为白色点
+        mask = abs_diff_np > 1
+        ys, xs = np.where(mask)
+        plt.scatter(xs, ys, color='white', s=1)  # s=1为点大小，可适当调大
+
+        plt.savefig(f"./figures/M={M}_N={N}_K={K}_err.png")
+
+        ys, xs = np.where(mask)
+        output_cuda_np = output_cuda.cpu().numpy()
+        output_ref_np = output_ref.cpu().numpy()
+
+        for y, x in zip(ys, xs):
+            print(f"位置 ({y}, {x}): output_cuda={output_cuda_np[y, x]}, output_ref={output_ref_np[y, x]}, abs_diff={abs_diff_np[y, x]}")
+
 
 if __name__ == "__main__":
     main()
