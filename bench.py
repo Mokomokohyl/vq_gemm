@@ -7,9 +7,9 @@ import vq_gemm_cuda
 
 M = 4096
 K = 4096
-N = 1024
+N = 2048
 ENTRY = 256
-RATIO = 4
+RATIO = 2
 
 device = torch.device('cuda')
 torch.manual_seed(42)
@@ -25,7 +25,7 @@ def vq_gemm_reference(input, w, codebook):
     RATIO = codebook.shape[2]
 
     # 计算每个列对应的分块行号
-    row_idx = torch.arange(N, device=w.device) // 2  # [N]
+    row_idx = torch.arange(N, device=w.device) // 4  # [N]
     # 展开为 [K, N]，每个元素是分块行号
     row_idx_expand = row_idx.unsqueeze(0).expand(K, N)
     # entry_idx就是w本身

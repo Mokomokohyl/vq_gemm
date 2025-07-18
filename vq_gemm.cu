@@ -14,7 +14,7 @@
 #define WARP_SIZE 32
 #define BLOCK_SIZE (WARP_NUM * WARP_SIZE)
 #define ENTRY 256
-#define RATIO 4
+#define RATIO 2
 #define RESIDUAL 1
 #define HOT 1
 
@@ -181,14 +181,17 @@ __device__ void storeC(half* C, uint32_t* frag, int m, int n) {
 }
 
 __device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook, half* codebook_shmem, int k, int n, int ko) {
-    // 32x32 uint8, every thread load 8 uint8 indices
+    // 32x64 uint8, every thread load 16 uint8 indices
     uint32_t local_id = (threadIdx.x % 4) * 4;
     uint32_t codebook_id = blockIdx.y * 16 + local_id;
-    uint8_t indices[8];
-    *(uint64_t*)(&indices[0]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 8]);
+
+    uint8_t indices[16];
+    *(uint64_t*)(&indices[0]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16]);
+    *(uint64_t*)(&indices[8]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16 + 8]);
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        *(uint64_t*)(&shmem[(threadIdx.x / 64) * (8 * 16 * 16) + (threadIdx.x % 4 * 8 + i) / 4 * 16 * 16 + ((threadIdx.x / 4) % 16) * 16 + ((threadIdx.x % 4 * 8 + i) * 4) % 16]) = *(uint64_t*)(&codebook_shmem[(local_id + i / 2) * 256 * 4 + ((uint32_t) indices[i]) * 4]);
+    for (int i = 0; i < 16; i++) {
+        *(uint32_t*)(&shmem[(threadIdx.x / 64) * (8 * 16 * 16) + (threadIdx.x % 4 * 16 + i) * 2 / 16 * (16 * 16) + (threadIdx.x / 4) % 16 * 16 + (threadIdx.x % 4 * 8 + i) * 2 % 16]) = *(uint32_t*)(&codebook_shmem[(local_id + i / 4) * 256 * RATIO + ((uint32_t) indices[i]) * RATIO]);
+        *(uint64_t*)(&shmem[(threadIdx.x / 64) * (8 * 16 * 16) + (threadIdx.x % 4) * (2 * 16 * 16) + (i / 4) * (16 * 16) + ((threadIdx.x % 64) / 4) * 16 + (i % 4) * 4]) = *(uint64_t*)(&codebook[(codebook_id + i / 2) * 256 * 4 + ((uint32_t) indices[i]) * 4]);
     }
 }
 
