@@ -10,10 +10,6 @@ setup(
                 'bind.cpp',
                 'vq_gemm.cu',
             ],
-            extra_cuda_cflags=[
-                '-O3',
-                '-arch=compute_120 -code=sm_120',
-            ]
         )
     ],
     cmdclass={
