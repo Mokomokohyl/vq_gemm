@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+import matplotlib.pyplot as plt
 
 import vq_gemm_cuda
 
@@ -65,8 +66,17 @@ def main():
     print(f"VQ GEMM output shape:{output_cuda.shape}")
     print("Row mean of VQ GEMM output (Reference):", output_ref.mean(dim=1))
     print("Row mean of VQ GEMM output (CUDA):", output_cuda.mean(dim=1))
+    abs_diff = (output_cuda.float() - output_ref.float()).abs()
     diff = (output_cuda.float() - output_ref.float()).abs().mean().item()
     print(f"Mean absolute difference (CUDA vs Reference): {diff:.6f}")
+    max_val, max_idx = abs_diff.max(), abs_diff.argmax()
+    max_row, max_col = divmod(max_idx.item(), abs_diff.shape[1])
+    print(f"Max abs diff: {max_val.item()}, at ({max_row}, {max_col})")
+
+    plt.imshow(abs_diff.cpu().numpy(), aspect='auto')
+    plt.colorbar()
+    plt.title("Absolute Error Heatmap")
+    plt.savefig(f"M={M}_N={N}_K={K}_VQGemm_error_heat_map.png")
 
 if __name__ == "__main__":
     main()
