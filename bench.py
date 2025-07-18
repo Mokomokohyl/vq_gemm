@@ -78,5 +78,22 @@ def main():
     plt.title("Absolute Error Heatmap")
     plt.savefig(f"M={M}_N={N}_K={K}_VQGemm_error_heat_map.png")
 
+    outs_cuda = []
+    outs_ref = []
+    for i in range(5):
+        outs_cuda.append(vq_gemm_cuda.e2e_gemm(input, w, codebook).cpu())
+        outs_ref.append(vq_gemm_reference(input, w, codebook).cpu())
+
+
+    # 比较 CUDA 输出是否一致
+    for i in range(1, 5):
+        same = torch.equal(outs_cuda[0], outs_cuda[i])
+        print(f"CUDA output run 0 vs {i}: {'一致' if same else '不一致'}")
+
+    # 比较 Reference 输出是否一致
+    for i in range(1, 5):
+        same = torch.equal(outs_ref[0], outs_ref[i])
+        print(f"Reference output run 0 vs {i}: {'一致' if same else '不一致'}")
+
 if __name__ == "__main__":
     main()
