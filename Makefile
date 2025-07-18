@@ -28,5 +28,9 @@ try-s2-128:
 	$(MAKE) try KERNELS=s2_128
 run-s2-128:
 	$(MAKE) run KERNELS=s2_128
+try-s3:
+	$(MAKE) try KERNELS=s3
+run-s3:
+	$(MAKE) run KERNELS=s3
 
 .PHONY: run compile try clean try-s1
