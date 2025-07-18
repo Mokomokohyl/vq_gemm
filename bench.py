@@ -73,10 +73,17 @@ def main():
     max_row, max_col = divmod(max_idx.item(), abs_diff.shape[1])
     print(f"Max abs diff: {max_val.item()}, at ({max_row}, {max_col})")
 
-    plt.imshow(abs_diff.cpu().numpy(), aspect='auto')
+    abs_diff_np = abs_diff.cpu().numpy()
+    plt.imshow(abs_diff_np, aspect='auto', cmap='viridis')
     plt.colorbar()
     plt.title("Absolute Error Heatmap")
-    plt.savefig(f"M={M}_N={N}_K={K}_VQGemm_error_heat_map.png")
+
+    # 叠加误差>1的位置为白色点
+    mask = abs_diff_np > 1
+    ys, xs = np.where(mask)
+    plt.scatter(xs, ys, color='white', s=1)  # s=1为点大小，可适当调大
+
+    plt.savefig(f"./figures/M={M}_N={N}_K={K}_err.png")
 
     outs_cuda = []
     outs_ref = []
