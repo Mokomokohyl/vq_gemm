@@ -20,6 +20,8 @@ source = {
             ]
 }
 
+base_nvcc_flags = ['-O2', '-arch=sm_120a', '--maxrregcount=128']
+
 if kernels_to_compile_str == 'all':
     kernels_to_compile = list(source.keys())
 else:
@@ -30,8 +32,9 @@ for kernels_to_compile_str in kernels_to_compile:
         name=f'vq_gemm_cuda_{kernels_to_compile_str}',
         ext_modules=[
             CUDAExtension(
-                f'vq_gemm_cuda_{kernels_to_compile_str}',
-                source[kernels_to_compile_str]
+                name=f'vq_gemm_cuda_{kernels_to_compile_str}',
+                sources=source[kernels_to_compile_str],
+                extra_compile_args={'cxx': ['-O2'], 'nvcc': base_nvcc_flags}
             )
         ],
         cmdclass={

@@ -76,7 +76,6 @@ __device__ void loadShmemB(half* shmem, half *B, int k, int n, int ko) {
 
 __device__ void loadFragA_mma(uint32_t* frag, half *shmem, int ki) {
     uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
     uint32_t lane_id = threadIdx.x % WARP_SIZE;
     for (int i = 0; i < 4; i++) {       // Warp do 64x16, 16x16 a time, so 4 times
         // for (int j = 0; j < 4; j++) {   // for every 16x16, every thread load 4 1x2 data
@@ -95,7 +94,6 @@ __device__ void loadFragA_mma(uint32_t* frag, half *shmem, int ki) {
 }
 
 __device__ void loadFragB_mma(uint32_t* frag, half *shmem, int ki) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
     uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
     uint32_t lane_id = threadIdx.x % WARP_SIZE;
     // for (int i = 0; i < 8; i++) {       // Warp do 16x64, 16x8 a time, so 8 times
@@ -154,8 +152,6 @@ __device__ void storeFragC_mma(half* shmem, uint32_t* frag) {
 }
 
 __device__ void storeShmemC(half *C, half* shmem, int m, int n) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
     for (int i = 0; i < (BLOCK_TILE_M * BLOCK_TILE_N) / (WARP_SIZE * WARP_NUM); i++) {
         int row = i * ((WARP_SIZE * WARP_NUM) / BLOCK_TILE_M) + threadIdx.x / BLOCK_TILE_N;
         int col = threadIdx.x % BLOCK_TILE_N;
@@ -183,7 +179,6 @@ __device__ void storeC(half* C, uint32_t* frag, int m, int n) {
 __device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook, half* codebook_shmem, int k, int n, int ko) {
     // 32x64 uint8, every thread load 16 uint8 indices
     uint32_t local_id = (threadIdx.x % 4) * 4;
-    uint32_t codebook_id = blockIdx.y * 16 + local_id;
 
     uint8_t indices[16];
     *(uint64_t*)(&indices[0]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16]);

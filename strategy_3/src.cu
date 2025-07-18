@@ -9,10 +9,10 @@
 #include "mma.h"
 #include <random>
 
-#define PROFILING 1
+#define PROFILING 0
 #define WARP_NUM 4
 #define WARP_SIZE 32
-#define BLOCK_SIZE (WARP_NUM * WARP_SIZE)
+#define BLOCK_SIZE 1024 // For s3 use 1024.
 #define ENTRY 256
 #define RATIO 2
 #define RESIDUAL 1
@@ -35,6 +35,30 @@
 #define MMA_TILE_K 16
 
 #define CODEBOOK_BUFFERING 1
+
+#define CHECK_LAST_CUDA_ERROR() checkLast(__FILE__, __LINE__)
+void checkLast(const char* const file, const int line)
+{
+    cudaError_t const err{cudaGetLastError()};
+    if (err != cudaSuccess)
+    {
+        std::cerr << "CUDA Runtime Error at: " << file << ":" << line
+                  << std::endl;
+        std::cerr << cudaGetErrorString(err) << std::endl;
+        // We don't exit when we encounter CUDA errors in this example.
+        // std::exit(EXIT_FAILURE);
+    }
+}
+
+template<uint32_t RegCount>
+__device__ __forceinline__ void warpgroup_reg_alloc(){
+  asm volatile( "setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount) );
+}
+
+template<uint32_t RegCount>
+__device__ __forceinline__ void warpgroup_reg_dealloc(){
+  asm volatile( "setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount) );
+}
 
 // A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
 #define MAX_SHARED_MEMORY_USAGE (16384 + CODEBOOK_BUFFERING * (32768 / HOT))
@@ -76,7 +100,6 @@ __device__ void loadShmemB(half* shmem, half *B, int k, int n, int ko) {
 
 __device__ void loadFragA_mma(uint32_t* frag, half *shmem, int ki) {
     uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
     uint32_t lane_id = threadIdx.x % WARP_SIZE;
     for (int i = 0; i < 4; i++) {       // Warp do 64x16, 16x16 a time, so 4 times
         // for (int j = 0; j < 4; j++) {   // for every 16x16, every thread load 4 1x2 data
@@ -95,7 +118,6 @@ __device__ void loadFragA_mma(uint32_t* frag, half *shmem, int ki) {
 }
 
 __device__ void loadFragB_mma(uint32_t* frag, half *shmem, int ki) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
     uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
     uint32_t lane_id = threadIdx.x % WARP_SIZE;
     // for (int i = 0; i < 8; i++) {       // Warp do 16x64, 16x8 a time, so 8 times
@@ -154,8 +176,6 @@ __device__ void storeFragC_mma(half* shmem, uint32_t* frag) {
 }
 
 __device__ void storeShmemC(half *C, half* shmem, int m, int n) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
     for (int i = 0; i < (BLOCK_TILE_M * BLOCK_TILE_N) / (WARP_SIZE * WARP_NUM); i++) {
         int row = i * ((WARP_SIZE * WARP_NUM) / BLOCK_TILE_M) + threadIdx.x / BLOCK_TILE_N;
         int col = threadIdx.x % BLOCK_TILE_N;
@@ -181,17 +201,14 @@ __device__ void storeC(half* C, uint32_t* frag, int m, int n) {
 }
 
 __device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook, half* codebook_shmem, int k, int n, int ko) {
-    // 32x64 uint8, every thread load 16 uint8 indices
-    uint32_t local_id = (threadIdx.x % 4) * 4;
-    uint32_t codebook_id = blockIdx.y * 16 + local_id;
+    // 32x64 uint8, 1024 threads, every thread dequant 2 uint8 indices
+    uint32_t row = threadIdx.x / 32;
+    uint32_t col = threadIdx.x % 32 * 2;
 
-    uint8_t indices[16];
-    *(uint64_t*)(&indices[0]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16]);
-    *(uint64_t*)(&indices[8]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16 + 8]);
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        *(uint32_t*)(&shmem[(threadIdx.x / 64) * (8 * 16 * 16) + (threadIdx.x % 4 * 16 + i) * 2 / 16 * (16 * 16) + (threadIdx.x / 4) % 16 * 16 + (threadIdx.x % 4 * 8 + i) * 2 % 16]) = *(uint32_t*)(&codebook_shmem[(local_id + i / 4) * 256 * RATIO + ((uint32_t) indices[i]) * RATIO]);
-    }
+    uint8_t indices[2];
+    *(half*)(&indices[0]) = *(half*)(&B_q[(ko * BLOCK_TILE_K + row) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + col]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + col * RATIO / 16 * (16 * 16) + row % 16 * 16 + col * RATIO % 16]) = *(uint32_t*)(&codebook_shmem[(col / 2) * 256 * RATIO + ((uint32_t) indices[0]) * RATIO]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + (col + 1) * RATIO / 16 * (16 * 16) + row % 16 * 16 * 16 + (col + 1) * RATIO % 16]) = *(uint32_t*)(&codebook_shmem[((col + 1) / 2) * 256 * RATIO + ((uint32_t) indices[1]) * RATIO]);
 }
 
 __device__ void load_codebook(
@@ -201,18 +218,17 @@ __device__ void load_codebook(
 {
     uint32_t codebook_begin_row = blockIdx.y * 16;
     // Assuming HOT is less than 16
-    uint32_t iters_to_load = ((16 * ENTRY * RATIO / HOT) / 8) / BLOCK_SIZE;
-    uint32_t load_cols = (ENTRY * RATIO / HOT) / 8;
-    uint32_t load_rows = BLOCK_SIZE / load_cols;
+    // uint32_t iters_to_load = ((16 * ENTRY * RATIO / HOT) / 8) / BLOCK_SIZE; // = 1
+    uint32_t load_cols = (ENTRY * RATIO / HOT) / 8; // = 64
+    // uint32_t load_rows = BLOCK_SIZE / load_cols; // = 16
 
-    #pragma unroll
-    for (int i = 0; i < iters_to_load; i++) {
-        asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n"
-        :
-        : "r"(shmem_uint32_t(&shmem[(i * load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO / HOT) + (threadIdx.x % load_cols) * 8])),
-          "l"(&codebook[(codebook_begin_row + i * load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
-        );
-    }
+    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n"
+    :
+    : "r"(shmem_uint32_t(&shmem[(threadIdx.x / load_cols) * (ENTRY * RATIO / HOT) + (threadIdx.x % load_cols) * 8])),
+        "l"(&codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
+    );
+    // *(int4*)(&shmem[(threadIdx.x / load_cols) * (ENTRY * RATIO / HOT) + (threadIdx.x % load_cols) * 8]))) = 
+    // *(int4*)(&codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
 }
 
 __global__ void e2e_gemm_kernel(
@@ -237,24 +253,39 @@ __global__ void e2e_gemm_kernel(
     asm volatile("cp.async.wait_all;\n"::);
     __syncthreads();
 
+    uint32_t warp_group_id = threadIdx.x / (WARP_SIZE * 4); // use warp_group_id to determine reg num.
+
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
-        loadShmemA(A1, _input, M, K, ko);
+        if (warp_group_id == 0) {
+            warpgroup_reg_dealloc<24>();
+        } else {
+            warpgroup_reg_alloc<24>();
+        }
         dequantToShmemB(B1, _w, _codebook, codebook_buf, K, N, ko);
         asm volatile("cp.async.wait_all;\n"::);
         __syncthreads();
-        for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
-            loadFragA_mma(A_frags, A1, ki);
-            loadFragB_mma(B_frags, B1, ki);
-            // dequantToRegB(B_frags, _w, _codebook, codebook_buf, K, N, ko, ki);
-            for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
-                for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
-                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+        if (warp_group_id == 0) { // the four warps doing mma
+            warpgroup_reg_alloc<256>();
+
+            loadShmemA(A1, _input, M, K, ko);
+            for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
+                loadFragA_mma(A_frags, A1, ki);
+                loadFragB_mma(B_frags, B1, ki);
+                // dequantToRegB(B_frags, _w, _codebook, codebook_buf, K, N, ko, ki);
+                for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
+                    for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
+                        compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+                    }
                 }
             }
+        } else { // other warp groups: do nothing
+            warpgroup_reg_dealloc<24>();
         }
         __syncthreads();
     }
-    storeC(_o, C_frags, M, N * RATIO);    
+    if (warp_group_id == 0) {
+        storeC(_o, C_frags, M, N * RATIO);    
+    }
 }
 
 torch::Tensor e2e_gemm(
@@ -308,6 +339,7 @@ torch::Tensor e2e_gemm(
             o_ptr,
             M, N, K
         );
+    CHECK_LAST_CUDA_ERROR();
 #if PROFILING == 1
     }
     cudaEventRecord(ed);
