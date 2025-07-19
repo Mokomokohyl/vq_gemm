@@ -282,15 +282,15 @@ __global__ void e2e_gemm_kernel(
 
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
         if (warp_group_id == 0) {
-            warpgroup_reg_dealloc<128>();
+            // warpgroup_reg_dealloc<128>();
         } else {
-            warpgroup_reg_alloc<128>();
+            // warpgroup_reg_alloc<128>();
         }
 
         dequantToShmemB(B1, _w, _codebook, codebook_buf, K, N, ko);
 
         if (warp_group_id == 0) { // the four warps doing mma
-            warpgroup_reg_alloc<256>();
+            // warpgroup_reg_alloc<256>();
 
             loadShmemA(A1, _input, M, K, ko);
             asm volatile("cp.async.wait_all;\n"::);
@@ -306,7 +306,7 @@ __global__ void e2e_gemm_kernel(
                 }
             }
         } else { // other warp groups: do nothing
-            warpgroup_reg_dealloc<24>();
+            // warpgroup_reg_dealloc<24>();
             token = bar[0].arrive();
         }
         __syncthreads();
