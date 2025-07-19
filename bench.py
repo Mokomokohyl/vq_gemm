@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 
 import vq_gemm_cuda_s1
 import vq_gemm_cuda_s2_128
+import vq_gemm_cuda_s2_1024
 import vq_gemm_cuda_s3
 
 M = 4096
@@ -15,6 +16,7 @@ kernel_to_use_str = os.getenv('KERNELS', 'all')
 module_dict = {
     "s1": vq_gemm_cuda_s1,
     "s2_128": vq_gemm_cuda_s2_128,
+    "s2_1024": vq_gemm_cuda_s2_1024,
     "s3": vq_gemm_cuda_s3
 }
 module = module_dict[kernel_to_use_str]

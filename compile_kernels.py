@@ -13,6 +13,11 @@ source = {
                 'bind.cpp',
                 './strategy_2/bsz128/src.cu',
             ],
+    's2_1024':
+            [
+                'bind.cpp',
+                './strategy_2/bsz1024/src.cu',
+            ],
     's3':
             [
                 'bind.cpp',
