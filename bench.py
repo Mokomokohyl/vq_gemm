@@ -63,15 +63,8 @@ def main():
         w = torch.randint(0, ENTRY, (K, N), dtype=torch.uint8, device=device)
         codebook = torch.randn(N // 4, ENTRY, RATIO, dtype=torch.float16, device=device)
         torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
 
         output_cuda = module.e2e_gemm(input, w, codebook)
-
-        end_event.record()
-        torch.cuda.synchronize()
-        elapsed_time = start_event.elapsed_time(end_event)
 
         output_ref = vq_gemm_reference(input, w, codebook)
 

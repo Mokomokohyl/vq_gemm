@@ -1,6 +1,7 @@
 #include "cuda.h"
 #include "cuda_runtime.h"
 #include "cuda_fp16.h"
+#include <cuda/ptx>
 #include <torch/extension.h>
 #include "stdio.h"
 #include <iostream>
@@ -9,10 +10,11 @@
 #include "mma.h"
 #include <random>
 
-#define PROFILING 0
+#define PROFILING 1
 #define WARP_NUM 4
 #define WARP_SIZE 32
-#define BLOCK_SIZE 1024 // For s3 use 1024.
+#define BLOCK_SIZE 512 // For s3 use 1024.
+#define MMA_BLOCK_SIZE 128
 #define ENTRY 256
 #define RATIO 2
 #define RESIDUAL 1
@@ -36,6 +38,7 @@
 
 #define CODEBOOK_BUFFERING 1
 
+
 #define CHECK_LAST_CUDA_ERROR() checkLast(__FILE__, __LINE__)
 void checkLast(const char* const file, const int line)
 {
@@ -49,6 +52,9 @@ void checkLast(const char* const file, const int line)
         // std::exit(EXIT_FAILURE);
     }
 }
+
+using barrier = cuda::barrier<cuda::thread_scope_block>;
+namespace ptx = cuda::ptx;
 
 template<uint32_t RegCount>
 __device__ __forceinline__ void warpgroup_reg_alloc(){
@@ -75,7 +81,7 @@ __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
 }
 
 __device__ void loadShmemA(half* shmem, half *A, int m, int k, int ko) {
-    for (int i = 0; i < ((BLOCK_TILE_M * BLOCK_TILE_K) / BLOCK_SIZE) / 8; i++) {
+    for (int i = 0; i < ((BLOCK_TILE_M * BLOCK_TILE_K) / MMA_BLOCK_SIZE) / 8; i++) {
         int row = i * 32 + threadIdx.x / 4;
         int col = 8 * (threadIdx.x % 4);
         asm volatile(
@@ -201,14 +207,17 @@ __device__ void storeC(half* C, uint32_t* frag, int m, int n) {
 }
 
 __device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook, half* codebook_shmem, int k, int n, int ko) {
-    // 32x64 uint8, 1024 threads, every thread dequant 2 uint8 indices
-    uint32_t row = threadIdx.x / 32;
-    uint32_t col = threadIdx.x % 32 * 2;
+    // 32x64 uint8, 512 threads, every thread dequant 4 uint8 indices
+    uint32_t row = threadIdx.x / 16; //  
+    uint32_t col = threadIdx.x % 16 * 4; // 4 * [0, 15]
+    uint32_t local_idx = col / 4;
 
-    uint8_t indices[2];
-    *(half*)(&indices[0]) = *(half*)(&B_q[(ko * BLOCK_TILE_K + row) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + col]);
-    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + col * RATIO / 16 * (16 * 16) + row % 16 * 16 + col * RATIO % 16]) = *(uint32_t*)(&codebook_shmem[(col / 2) * 256 * RATIO + ((uint32_t) indices[0]) * RATIO]);
-    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + (col + 1) * RATIO / 16 * (16 * 16) + row % 16 * 16 * 16 + (col + 1) * RATIO % 16]) = *(uint32_t*)(&codebook_shmem[((col + 1) / 2) * 256 * RATIO + ((uint32_t) indices[1]) * RATIO]);
+    uint8_t indices[4];
+    *(uint32_t*)(&indices[0]) = *(uint32_t*)(&B_q[(ko * BLOCK_TILE_K + row) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + col]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + col * RATIO / 16 * (16 * 16) + row % 16 * 16 + (col * RATIO) % 16]) = *(uint32_t*)(&codebook_shmem[local_idx * 256 * RATIO + ((uint32_t) indices[0]) * RATIO]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + (col + 1) * RATIO / 16 * (16 * 16) + row % 16 * 16 + ((col + 1) * RATIO) % 16]) = *(uint32_t*)(&codebook_shmem[local_idx * 256 * RATIO + ((uint32_t) indices[1]) * RATIO]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + (col + 2) * RATIO / 16 * (16 * 16) + row % 16 * 16 + ((col + 2) * RATIO) % 16]) = *(uint32_t*)(&codebook_shmem[local_idx * 256 * RATIO + ((uint32_t) indices[2]) * RATIO]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + (col + 3) * RATIO / 16 * (16 * 16) + row % 16 * 16 + ((col + 3) * RATIO) % 16]) = *(uint32_t*)(&codebook_shmem[local_idx * 256 * RATIO + ((uint32_t) indices[3]) * RATIO]);
 }
 
 __device__ void load_codebook(
@@ -218,17 +227,24 @@ __device__ void load_codebook(
 {
     uint32_t codebook_begin_row = blockIdx.y * 16;
     // Assuming HOT is less than 16
-    // uint32_t iters_to_load = ((16 * ENTRY * RATIO / HOT) / 8) / BLOCK_SIZE; // = 1
-    uint32_t load_cols = (ENTRY * RATIO / HOT) / 8; // = 64
-    // uint32_t load_rows = BLOCK_SIZE / load_cols; // = 16
+    // uint32_t iters_to_load = ((16 * ENTRY * RATIO / HOT) / 8) / BLOCK_SIZE; // = 2
+    uint32_t load_cols = (ENTRY * RATIO) / 8; // = 64
+    uint32_t load_rows = BLOCK_SIZE / load_cols; // = 8
 
-    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n"
+    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n" 
     :
-    : "r"(shmem_uint32_t(&shmem[(threadIdx.x / load_cols) * (ENTRY * RATIO / HOT) + (threadIdx.x % load_cols) * 8])),
+    :   "r"(shmem_uint32_t(&shmem[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])), 
         "l"(&codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
     );
-    // *(int4*)(&shmem[(threadIdx.x / load_cols) * (ENTRY * RATIO / HOT) + (threadIdx.x % load_cols) * 8]))) = 
+    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n" 
+    :
+    :   "r"(shmem_uint32_t(&shmem[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])),
+        "l"(&codebook[(load_rows + codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
+    );
+    // *(int4*)(&shmem[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
     // *(int4*)(&codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
+    // *(int4*)(&shmem[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
+    // *(int4*)(&codebook[(load_rows + codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
 }
 
 __global__ void e2e_gemm_kernel(
@@ -239,6 +255,15 @@ __global__ void e2e_gemm_kernel(
     int M, int N, int K
 )
 {
+    auto block = cooperative_groups::this_thread_block();
+    __shared__ barrier bar[1];
+    __shared__ barrier::arrival_token token;
+    if (block.thread_rank() == 0) {
+        init(bar, block.size());
+        ptx::fence_proxy_async(ptx::space_shared);
+    }
+    block.sync();
+
     extern __shared__ uint8_t shmem[];
     half *A1 = reinterpret_cast<half*>(shmem);
     half *B1 = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
@@ -257,17 +282,19 @@ __global__ void e2e_gemm_kernel(
 
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
         if (warp_group_id == 0) {
-            warpgroup_reg_dealloc<24>();
+            warpgroup_reg_dealloc<128>();
         } else {
-            warpgroup_reg_alloc<24>();
+            warpgroup_reg_alloc<128>();
         }
+
         dequantToShmemB(B1, _w, _codebook, codebook_buf, K, N, ko);
-        asm volatile("cp.async.wait_all;\n"::);
-        __syncthreads();
+
         if (warp_group_id == 0) { // the four warps doing mma
             warpgroup_reg_alloc<256>();
 
             loadShmemA(A1, _input, M, K, ko);
+            asm volatile("cp.async.wait_all;\n"::);
+            bar[0].arrive_and_wait();
             for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
                 loadFragA_mma(A_frags, A1, ki);
                 loadFragB_mma(B_frags, B1, ki);
@@ -280,6 +307,7 @@ __global__ void e2e_gemm_kernel(
             }
         } else { // other warp groups: do nothing
             warpgroup_reg_dealloc<24>();
+            token = bar[0].arrive();
         }
         __syncthreads();
     }
