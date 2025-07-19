@@ -206,7 +206,7 @@ __device__ void storeC(half* C, uint32_t* frag, int m, int n) {
     }
 }
 
-__device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook, half* codebook_shmem, int k, int n, int ko) {
+__device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook_shmem, int k, int n, int ko) {
     // 32x64 uint8, 512 threads, every thread dequant 4 uint8 indices
     uint32_t row = threadIdx.x / 16; //  
     uint32_t col = threadIdx.x % 16 * 4; // 4 * [0, 15]
@@ -287,7 +287,7 @@ __global__ void e2e_gemm_kernel(
             // warpgroup_reg_alloc<128>();
         }
 
-        dequantToShmemB(B1, _w, _codebook, codebook_buf, K, N, ko);
+        dequantToShmemB(B1, _w, codebook_buf, K, N, ko);
 
         if (warp_group_id == 0) { // the four warps doing mma
             // warpgroup_reg_alloc<256>();
