@@ -18,3 +18,4 @@ Error heat map are generated in ./figures/
 - [ ] `s2-1024`
 - [ ] optimize dequant kernel in `s1`
 - [ ] optimize dequant func in `s3`.
+- [ ] find how to use `setmaxnreg` correctly
