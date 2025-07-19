@@ -11,7 +11,9 @@ import vq_gemm_cuda_s3
 M = 4096
 K = 4096
 N = 2048
-run_vq_gemm = 1
+run_vq_gemm = not (os.getenv('TEST_GEMM', 'FALSE') == 'TRUE')
+if not run_vq_gemm:
+    M = N = K = 4096
 kernel_to_use_str = os.getenv('KERNELS', 'all')
 module_dict = {
     "s1": vq_gemm_cuda_s1,
@@ -111,6 +113,7 @@ def main():
             print(f"Reference output run 0 vs {i}: {'一致' if same else '不一致'}")
 
     else: # test gemm
+        print(f"------------ test gemm ------------")
         input = torch.randn(M, K, dtype=torch.float16, device=device)
         w = torch.rand(K, N, dtype=torch.float16, device=device)
         output_cuda = module.gemm(input, w)
