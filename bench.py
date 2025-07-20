@@ -147,9 +147,6 @@ def main():
         output_cuda_np = output_cuda.cpu().numpy()
         output_ref_np = output_ref.cpu().numpy()
 
-        for y, x in zip(ys, xs):
-            print(f"位置 ({y}, {x}): output_cuda={output_cuda_np[y, x]}, output_ref={output_ref_np[y, x]}, abs_diff={abs_diff_np[y, x]}")
-
 
 if __name__ == "__main__":
     main()
