@@ -71,6 +71,8 @@ def main():
         output_cuda = module.e2e_gemm(input, w, codebook)
         torch.cuda.synchronize()
 
+        torch.cuda.synchronize()
+
         output_ref = vq_gemm_reference(input, w, codebook)
 
         print(f"VQ GEMM output shape:{output_cuda.shape}")
