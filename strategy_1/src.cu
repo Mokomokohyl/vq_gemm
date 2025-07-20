@@ -531,7 +531,7 @@ torch::Tensor gemm(
 
     cudaFuncSetAttribute(gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
     dim3 grid(M / BLOCK_TILE_M, N / BLOCK_TILE_N);
-    dim3 block(BLOCK_SIZE);
+    dim3 block(32, 2, 2);
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
         gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
@@ -651,7 +651,7 @@ torch::Tensor e2e_gemm(
     half* B_ptr = reinterpret_cast<half*>(B.data_ptr<at::Half>());
 
     dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
-    dim3 block(BLOCK_SIZE); // = 128
+    dim3 block(32, 2, 2); // = 128
     cudaFuncSetAttribute(gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
     // For dequant kernel
     dim3 dq_grid(M / DQ_BLOCK_TILE_M, N / DQ_BLOCK_TILE_N); // 4096 / 128 blocks. split on N
