@@ -9,36 +9,6 @@
 #include "mma.h"
 #include <random>
 
-// thread block tile size: 128*128*32 (2*2 warps)
-const int THREADBLOCK_M = 128;
-const int THREADBLOCK_N = 128;
-const int THREADBLOCK_K = 32;
-// warp tile size: 64*64*16 (4*4 WMMA)
-const int WARP_M = 64;
-const int WARP_N = 64;
-const int WARP_K = 16;
-// WMMA tile size: 16*16*16
-const int WMMA_M = 16;
-const int WMMA_N = 16;
-const int WMMA_K = 16;
-// thread block dim: 32*2*2
-const int THREAD_X = 32;
-const int THREAD_Y = 2; // warps along N
-const int THREAD_Z = 2; // warps along M
-constexpr int THREAD_NUM = THREAD_X * THREAD_Y * THREAD_Z;
-// fragment number
-constexpr int FRAG_A_SIZE = WARP_M / WMMA_M; // 4
-constexpr int FRAG_B_SIZE = WARP_N / WMMA_N; // 4
-// times of loop
-constexpr int K_WARP_COUNT = THREADBLOCK_K / WARP_K; // 2
-constexpr int M_WMMA_COUNT = WARP_M / WMMA_M; // 4
-constexpr int N_WMMA_COUNT = WARP_N / WMMA_N; // 4
-// 4-stage pipeline multiplier
-const int PIPELINE = 8; // 16 bytes = 8 halves
-
-// Kernel to dequantize B_q using a codebook and write to B.
-// Each input index produces two half-precision outputs.
-
 #define PROFILING 0
 #define WARP_NUM 4
 #define WARP_SIZE 32
@@ -72,11 +42,36 @@ const int PIPELINE = 8; // 16 bytes = 8 halves
 #define DQ_BLOCK_TILE_M 32
 
 // A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
-// #define MAX_SHARED_MEMORY_USAGE ((THREADBLOCK_M + THREADBLOCK_N) * THREADBLOCK_K * sizeof(half) + THREADBLOCK_M * THREADBLOCK_N * sizeof(float) + CODEBOOK_BUFFERING * (32768 / HOT))
-#define MAX_SHARED_MEMORY_USAGE ((THREADBLOCK_M + THREADBLOCK_N) * THREADBLOCK_K * sizeof(half) * 4)
+// #define MAX_SHARED_MEMORY_USAGE ((BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half) + BLOCK_TILE_M * BLOCK_TILE_N * sizeof(float) + CODEBOOK_BUFFERING * (32768 / HOT))
+#define MAX_SHARED_MEMORY_USAGE ((BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half) * 4)
 // uint8(1) -> half(2) + codebook
 #define DEQUANT_SHARED_MEMORY_USAGE (DQ_BLOCK_TILE_N * DQ_BLOCK_TILE_M * RATIO * 2 + DQ_BLOCK_TILE_N / 4 * ENTRY * RATIO * 2)
 #define GEMM_SHARED_MEMORY_USAGE (BLOCK_TILE_M * BLOCK_TILE_K * 2 + BLOCK_TILE_K * RATIO * BLOCK_TILE_N * 2)
+
+// warp tile size: 64*64*16 (4*4 WMMA)
+const int WARP_M = 64;
+const int WARP_N = 64;
+const int WARP_K = 16;
+// WMMA tile size: 16*16*16
+const int WMMA_M = 16;
+const int WMMA_N = 16;
+const int WMMA_K = 16;
+// thread block dim: 32*2*2
+const int THREAD_X = 32;
+const int THREAD_Y = 2; // warps along N
+const int THREAD_Z = 2; // warps along M
+constexpr int THREAD_NUM = THREAD_X * THREAD_Y * THREAD_Z;
+// fragment number
+constexpr int FRAG_A_SIZE = WARP_M / WMMA_M; // 4
+constexpr int FRAG_B_SIZE = WARP_N / WMMA_N; // 4
+// times of loop
+constexpr int K_WARP_COUNT = BLOCK_TILE_K / WARP_K; // 2
+constexpr int M_WMMA_COUNT = WARP_M / WMMA_M; // 4
+constexpr int N_WMMA_COUNT = WARP_N / WMMA_N; // 4
+// 4-stage pipeline multiplier
+const int PIPELINE = 8; // 16 bytes = 8 halves
+
+
 __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     uint32_t addr;
     asm volatile(
@@ -106,21 +101,21 @@ void checkLast(const char* const file, const int line)
 // For a 4-stage pipeline using cp.async, we load 8 halves at a time instead of 1. 
 
 // Loads a tile of A from global memory into shared memory.
-// THREADBLOCK_M * THREADBLOCK_K
+// BLOCK_TILE_M * BLOCK_TILE_K
 __device__ void loadSmemA(half *smem, half *A, const int M, const int K, int ko) {
     int thread_id = threadIdx.x + threadIdx.y * THREAD_X + threadIdx.z * THREAD_X * THREAD_Y;
-    constexpr int TURNS = (THREADBLOCK_M * THREADBLOCK_K) / THREAD_NUM / PIPELINE;
+    constexpr int TURNS = (BLOCK_TILE_M * BLOCK_TILE_K) / THREAD_NUM / PIPELINE;
     for (int i = 0; i < TURNS; i++) {
-        int row = i * (THREAD_NUM / THREADBLOCK_K * PIPELINE) + thread_id / (THREADBLOCK_K / PIPELINE); // i * 32 + thread_id / 4;
-        int col = thread_id % (THREADBLOCK_K / PIPELINE) * PIPELINE; // thread_id % 4 * 8
+        int row = i * (THREAD_NUM / BLOCK_TILE_K * PIPELINE) + thread_id / (BLOCK_TILE_K / PIPELINE); // i * 32 + thread_id / 4;
+        int col = thread_id % (BLOCK_TILE_K / PIPELINE) * PIPELINE; // thread_id % 4 * 8
         
         // layout: [row_out, col_out, row_in, col_in] = [8, 2, 16, 16]
         int row_out = row / WMMA_M; // row / 16
         int col_out = col / WMMA_K; // col / 16
         int row_in = row % WMMA_M; // row % 16
         int col_in = col % WMMA_K; // col % 16
-        int smem_index = row_out * (THREADBLOCK_K * WMMA_M) + col_out * (WMMA_K * WMMA_M) + row_in * WMMA_K + col_in;
-        int A_index = (blockIdx.y * THREADBLOCK_M + row) * K + ko * THREADBLOCK_K + col;
+        int smem_index = row_out * (BLOCK_TILE_K * WMMA_M) + col_out * (WMMA_K * WMMA_M) + row_in * WMMA_K + col_in;
+        int A_index = (blockIdx.x * BLOCK_TILE_M + row) * K + ko * BLOCK_TILE_K + col;
 
         void *ptr = (void *)(smem + smem_index);
         uint32_t smem_ptr;
@@ -165,21 +160,25 @@ __device__ void loadSmemA(half *smem, half *A, const int M, const int K, int ko)
 }
 
 // Loads a tile of B from global memory into shared memory.
-// THREADBLOCK_N * THREADBLOCK_K
+// BLOCK_TILE_N * BLOCK_TILE_K
 __device__ void loadSmemB(half *smem, half *B, const int N, const int K, int ko) {
     int thread_id = threadIdx.x + threadIdx.y * THREAD_X + threadIdx.z * THREAD_X * THREAD_Y;
-    constexpr int TURNS = (THREADBLOCK_N * THREADBLOCK_K) / THREAD_NUM / PIPELINE;
+    constexpr int TURNS = (BLOCK_TILE_N * BLOCK_TILE_K) / THREAD_NUM / PIPELINE;
     for (int i = 0; i < TURNS; i++) {
-        int row = i * (THREAD_NUM / THREADBLOCK_K * PIPELINE) + thread_id / (THREADBLOCK_K / PIPELINE); // i * 32 + thread_id / 4;
-        int col = thread_id % (THREADBLOCK_K / PIPELINE) * PIPELINE; // thread_id % 4 * 8
+        // int row = i * (THREAD_NUM / BLOCK_TILE_K * PIPELINE) + thread_id / (BLOCK_TILE_K / PIPELINE); // i * 32 + thread_id / 4;
+        // int col = thread_id % (BLOCK_TILE_K / PIPELINE) * PIPELINE; // thread_id % 4 * 8
+        int row = thread_id / 4;
+        int col = i * 32 + thread_id % 4 * 8;
         
         // layout: [row_out, col_out, row_in, col_in] = [8, 2, 16, 16]
         int row_out = row / WMMA_N; // row / 16
         int col_out = col / WMMA_K; // col / 16
         int row_in = row % WMMA_N; // row % 16
         int col_in = col % WMMA_K; // col % 16
-        int smem_index = row_out * (THREADBLOCK_K * WMMA_N) + col_out * (WMMA_K * WMMA_N) + row_in * WMMA_K + col_in;
-        int B_index = (blockIdx.x * THREADBLOCK_N + row) * K + ko * THREADBLOCK_K + col;
+        // int smem_index = row_out * (BLOCK_TILE_K * WMMA_N) + col_out * (WMMA_K * WMMA_N) + row_in * WMMA_K + col_in;
+        // int B_index = (blockIdx.y * BLOCK_TILE_N + row) * K + ko * BLOCK_TILE_K + col;
+        int smem_index = row_out * 8 * 16 * 16 + col_out * 16 * 16 + row_in * 16 + col_in;
+        int B_index = (ko * BLOCK_TILE_K + row) * K + blockIdx.y * BLOCK_TILE_N + col;
 
         void *ptr = (void *)(smem + smem_index);
         uint32_t smem_ptr;
@@ -197,21 +196,21 @@ __device__ void loadSmemB(half *smem, half *B, const int N, const int K, int ko)
 }
 
 // Stores a tile of C from shared memory into global memory.
-// THREADBLOCK_M * THREADBLOCK_N
+// BLOCK_TILE_M * BLOCK_TILE_N
 __device__ void storeSmemC(half *C, float *smem, const int M, const int N) {
     int thread_id = threadIdx.x + threadIdx.y * THREAD_X + threadIdx.z * THREAD_X * THREAD_Y;
-    constexpr int TURNS = (THREADBLOCK_M * THREADBLOCK_N) / THREAD_NUM;
+    constexpr int TURNS = (BLOCK_TILE_M * BLOCK_TILE_N) / THREAD_NUM;
     for (int i = 0; i < TURNS; i++) {
-        int row = i * (THREAD_NUM / THREADBLOCK_N) + thread_id / THREADBLOCK_N; // i
-        int col = thread_id % THREADBLOCK_N; // thread_id
+        int row = i * (THREAD_NUM / BLOCK_TILE_N) + thread_id / BLOCK_TILE_N; // i
+        int col = thread_id % BLOCK_TILE_N; // thread_id
         
         // layout: [row_out, col_out, row_in, col_in] = [8, 8, 16, 16]
         int row_out = row / WMMA_M; // row / 16
         int col_out = col / WMMA_N; // col / 16
         int row_in = row % WMMA_M; // row % 16
         int col_in = col % WMMA_N; // col % 16
-        int smem_index = row_out * (THREADBLOCK_N * WMMA_M) + col_out * (WMMA_N * WMMA_M) + row_in * WMMA_N + col_in;
-        int C_index = (blockIdx.y * THREADBLOCK_M + row) * N + blockIdx.x * THREADBLOCK_N + col;
+        int smem_index = row_out * (BLOCK_TILE_N * WMMA_M) + col_out * (WMMA_N * WMMA_M) + row_in * WMMA_N + col_in;
+        int C_index = (blockIdx.x * BLOCK_TILE_M + row) * N + blockIdx.y * BLOCK_TILE_N + col;
 
         C[C_index] = __float2half(smem[smem_index]);
     }
@@ -228,7 +227,7 @@ __device__ void loadFragA(nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M,
         int col_out = col / WMMA_K; // col / 16
         int row_in = row % WMMA_M; // row % 16
         int col_in = col % WMMA_K; // col % 16
-        int smem_index = row_out * (THREADBLOCK_K * WMMA_M) + col_out * (WMMA_K * WMMA_M) + row_in * WMMA_K + col_in;
+        int smem_index = row_out * (BLOCK_TILE_K * WMMA_M) + col_out * (WMMA_K * WMMA_M) + row_in * WMMA_K + col_in;
         // wmma::load_matrix_sync(fragment, smem_ptr, stride)
         // smem_ptr: pointer to start of tile
         // stride: leading dimension in memory
@@ -240,14 +239,16 @@ __device__ void loadFragA(nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M,
 // WARP_N * WARP_K
 __device__ void loadFragB(nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::row_major> *frag, half *smem, int ki) {
     for (int i = 0; i < FRAG_B_SIZE; i++) {
-        int row = threadIdx.y * WARP_N + i * WMMA_N;
-        int col = ki * WMMA_K;
-        // layout: [8, 2, 16, 16]
-        int row_out = row / WMMA_N; // row / 16
-        int col_out = col / WMMA_K; // col / 16
-        int row_in = row % WMMA_N; // row % 16
-        int col_in = col % WMMA_K; // col % 16
-        int smem_index = row_out * (THREADBLOCK_K * WMMA_N) + col_out * (WMMA_K * WMMA_N) + row_in * WMMA_K + col_in;
+        // int row = threadIdx.y * WARP_N + i * WMMA_N;
+        // int col = ki * WMMA_K;
+        int row = ki * WMMA_K;
+        int col = threadIdx.y * WARP_N + i * WMMA_N;
+        // layout: [2, 8, 16, 16]
+        int row_out = row / WMMA_K; // row / 16
+        int col_out = col / WMMA_N; // col / 16
+        int row_in = row % WMMA_K; // row % 16
+        int col_in = col % WMMA_N; // col % 16
+        int smem_index = row_out * (BLOCK_TILE_N * WMMA_K) + col_out * (WMMA_K * WMMA_N) + row_in * WMMA_K + col_in;
         // wmma::load_matrix_sync(fragment, smem_ptr, stride)
         // smem_ptr: pointer to start of tile
         // stride: leading dimension in memory
@@ -267,7 +268,7 @@ __device__ void storeFragC(nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMM
             int col_out = col / WMMA_N; // col / 16
             int row_in = row % WMMA_M; // row % 16
             int col_in = col % WMMA_N; // col % 16
-            int smem_index = row_out * (THREADBLOCK_N * WMMA_M) + col_out * (WMMA_N * WMMA_M) + row_in * WMMA_N + col_in;
+            int smem_index = row_out * (BLOCK_TILE_N * WMMA_M) + col_out * (WMMA_N * WMMA_M) + row_in * WMMA_N + col_in;
             int frag_index = i * FRAG_B_SIZE + j;
             // wmma::load_matrix_sync(smem_ptr, fragment, stride, layout)
             // smem_ptr: pointer to start of tile
@@ -291,13 +292,13 @@ __global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
     // reinterpret_cast<TYPE *>: Treat the memory at this address as a pointer to TYPE, even if it's not originally that type.
     // 4-stage pipeline
     half *As1 = reinterpret_cast<half *>(shared_storage);
-    half *As2 = As1 + THREADBLOCK_M * THREADBLOCK_K;
-    half *As3 = As2 + THREADBLOCK_M * THREADBLOCK_K;
-    half *As4 = As3 + THREADBLOCK_M * THREADBLOCK_K;
-    half *Bs1 = As4 + THREADBLOCK_M * THREADBLOCK_K;
-    half *Bs2 = Bs1 + THREADBLOCK_N * THREADBLOCK_K;
-    half *Bs3 = Bs2 + THREADBLOCK_N * THREADBLOCK_K;
-    half *Bs4 = Bs3 + THREADBLOCK_N * THREADBLOCK_K;
+    half *As2 = As1 + BLOCK_TILE_M * BLOCK_TILE_K;
+    half *As3 = As2 + BLOCK_TILE_M * BLOCK_TILE_K;
+    half *As4 = As3 + BLOCK_TILE_M * BLOCK_TILE_K;
+    half *Bs1 = As4 + BLOCK_TILE_M * BLOCK_TILE_K;
+    half *Bs2 = Bs1 + BLOCK_TILE_N * BLOCK_TILE_K;
+    half *Bs3 = Bs2 + BLOCK_TILE_N * BLOCK_TILE_K;
+    half *Bs4 = Bs3 + BLOCK_TILE_N * BLOCK_TILE_K;
     // half * half = float
     float *Cs = reinterpret_cast<float *>(shared_storage);
 
@@ -332,12 +333,12 @@ __global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
     loadSmemB(Bs3, B, N, K, 2);
     asm volatile("cp.async.commit_group;\n" ::);
 
-    int K_THREADBLOCK_COUNT = K / THREADBLOCK_K; // 64
-    for (int ko = 0; ko < K_THREADBLOCK_COUNT - 4; ko += 4) {
+    int K_BLOCK_TILE_COUNT = K / BLOCK_TILE_K; // 64
+    for (int ko = 0; ko < K_BLOCK_TILE_COUNT - 4; ko += 4) {
         // Wait until 2 previously committed async copy groups have finished.
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        if (ko + 3 < K_THREADBLOCK_COUNT) {
+        if (ko + 3 < K_BLOCK_TILE_COUNT) {
             loadSmemA(As4, A, M, K, ko + 3);
             loadSmemB(Bs4, B, N, K, ko + 3);
             asm volatile("cp.async.commit_group;\n" ::);
@@ -357,7 +358,7 @@ __global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        if (ko + 4 < K_THREADBLOCK_COUNT) {
+        if (ko + 4 < K_BLOCK_TILE_COUNT) {
             loadSmemA(As1, A, M, K, ko + 4);
             loadSmemB(Bs1, B, N, K, ko + 4);
             asm volatile("cp.async.commit_group;\n" ::);
@@ -377,7 +378,7 @@ __global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        if (ko + 5 < K_THREADBLOCK_COUNT) {
+        if (ko + 5 < K_BLOCK_TILE_COUNT) {
             loadSmemA(As2, A, M, K, ko + 5);
             loadSmemB(Bs2, B, N, K, ko + 5);
             asm volatile("cp.async.commit_group;\n" ::);
@@ -397,7 +398,7 @@ __global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        if (ko + 6 < K_THREADBLOCK_COUNT) {
+        if (ko + 6 < K_BLOCK_TILE_COUNT) {
             loadSmemA(As3, A, M, K, ko + 6);
             loadSmemB(Bs3, B, N, K, ko + 6);
             //asm volatile("cp.async.commit_group;\n" ::);
@@ -416,10 +417,10 @@ __global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
         }
     }
     {
-        int ko = (K_THREADBLOCK_COUNT / 4 - 1) * 4;
+        int ko = (K_BLOCK_TILE_COUNT / 4 - 1) * 4;
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        if (ko + 3 < K_THREADBLOCK_COUNT) {
+        if (ko + 3 < K_BLOCK_TILE_COUNT) {
             loadSmemA(As4, A, M, K, ko + 3);
             loadSmemB(Bs4, B, N, K, ko + 3);
             asm volatile("cp.async.commit_group;\n" ::);
@@ -439,7 +440,7 @@ __global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        if (ko + 4 < K_THREADBLOCK_COUNT) {
+        if (ko + 4 < K_BLOCK_TILE_COUNT) {
             loadSmemA(As1, A, M, K, ko + 4);
             loadSmemB(Bs1, B, N, K, ko + 4);
             asm volatile("cp.async.commit_group;\n" ::);
@@ -459,7 +460,7 @@ __global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(1));
         __syncthreads();
-        if (ko + 5 < K_THREADBLOCK_COUNT) {
+        if (ko + 5 < K_BLOCK_TILE_COUNT) {
             loadSmemA(As2, A, M, K, ko + 5);
             loadSmemB(Bs2, B, N, K, ko + 5);
             asm volatile("cp.async.commit_group;\n" ::);
@@ -479,7 +480,7 @@ __global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(0));
         __syncthreads();
-        if (ko + 6 < K_THREADBLOCK_COUNT) {
+        if (ko + 6 < K_BLOCK_TILE_COUNT) {
             loadSmemA(As3, A, M, K, ko + 6);
             loadSmemB(Bs3, B, N, K, ko + 6);
         }
@@ -528,6 +529,7 @@ torch::Tensor gemm(
     half* w_ptr = reinterpret_cast<half*>(w.data_ptr<at::Half>());
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
 
+    cudaFuncSetAttribute(gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
     dim3 grid(M / BLOCK_TILE_M, N / BLOCK_TILE_N);
     dim3 block(BLOCK_SIZE);
 #if PROFILING == 1
@@ -650,6 +652,7 @@ torch::Tensor e2e_gemm(
 
     dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
     dim3 block(BLOCK_SIZE); // = 128
+    cudaFuncSetAttribute(gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
     // For dequant kernel
     dim3 dq_grid(M / DQ_BLOCK_TILE_M, N / DQ_BLOCK_TILE_N); // 4096 / 128 blocks. split on N
     dim3 dq_block(DQ_BLOCK_SIZE); // = 1024
