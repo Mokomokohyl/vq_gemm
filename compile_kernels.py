@@ -25,7 +25,7 @@ source = {
             ]
 }
 
-base_nvcc_flags = ['-O2', '-arch=sm_120a', '--maxrregcount=128']
+base_nvcc_flags = ['-arch=sm_120a']
 
 if kernels_to_compile_str == 'all':
     kernels_to_compile = list(source.keys())
