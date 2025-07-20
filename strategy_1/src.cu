@@ -9,6 +9,48 @@
 #include "mma.h"
 #include <random>
 
+// Size constants
+const int M = 4096;
+const int N = 4096;
+const int K = 4096; // K should be at least 128 for a 4-stage pipeline
+constexpr int N_Q = N;
+constexpr int K_Q = K / 2;
+const int THREAD_X_DEQ = 32;
+const int THREAD_Y_DEQ = 32;
+const int CODEBOOK_SIZE = 256;
+
+// thread block tile size: 128*128*32 (2*2 warps)
+const int THREADBLOCK_M = 128;
+const int THREADBLOCK_N = 128;
+const int THREADBLOCK_K = 32;
+// warp tile size: 64*64*16 (4*4 WMMA)
+const int WARP_M = 64;
+const int WARP_N = 64;
+const int WARP_K = 16;
+// WMMA tile size: 16*16*16
+const int WMMA_M = 16;
+const int WMMA_N = 16;
+const int WMMA_K = 16;
+// thread block dim: 32*2*2
+const int THREAD_X = 32;
+const int THREAD_Y = 2; // warps along N
+const int THREAD_Z = 2; // warps along M
+constexpr int THREAD_NUM = THREAD_X * THREAD_Y * THREAD_Z;
+// fragment number
+constexpr int FRAG_A_SIZE = WARP_M / WMMA_M; // 4
+constexpr int FRAG_B_SIZE = WARP_N / WMMA_N; // 4
+// times of loop
+constexpr int K_WARP_COUNT = THREADBLOCK_K / WARP_K; // 2
+constexpr int M_WMMA_COUNT = WARP_M / WMMA_M; // 4
+constexpr int N_WMMA_COUNT = WARP_N / WMMA_N; // 4
+const int WARM_UP_COUNT = 50;
+const int ITERATION_COUNT = 100;
+// 4-stage pipeline multiplier
+const int PIPELINE = 8; // 16 bytes = 8 halves
+
+// Kernel to dequantize B_q using a codebook and write to B.
+// Each input index produces two half-precision outputs.
+
 #define PROFILING 1
 #define WARP_NUM 4
 #define WARP_SIZE 32
@@ -42,167 +84,407 @@
 #define DQ_BLOCK_TILE_KI 32
 
 // A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
-#define MAX_SHARED_MEMORY_USAGE (16384 + CODEBOOK_BUFFERING * (32768 / HOT))
+#define MAX_SHARED_MEMORY_USAGE ((THREADBLOCK_M + THREADBLOCK_N) * THREADBLOCK_K * sizeof(half) + THREADBLOCK_M * THREADBLOCK_N * sizeof(float) + CODEBOOK_BUFFERING * (32768 / HOT))
 // uint8(1) -> half(2) + codebook
 #define DEQUANT_SHARED_MEMORY_USAGE (DQ_BLOCK_TILE_N * DQ_BLOCK_TILE_KI * RATIO * 2 + DQ_BLOCK_TILE_N / 4 * ENTRY * RATIO * 2)
 #define GEMM_SHARED_MEMORY_USAGE (BLOCK_TILE_M * BLOCK_TILE_K * 2 + BLOCK_TILE_K * RATIO * BLOCK_TILE_N * 2)
-__device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
-    uint32_t addr;
-    asm volatile(
-        "{.reg .u64 u64addr;\n"
-        " cvta.to.shared.u64 u64addr, %1;\n"
-        " cvt.u32.u64 %0, u64addr;}\n"
-        : "=r"(addr)
-        : "l"(shmem_ptr)
-    );
-    return addr;
-}
 
-__device__ void loadShmemA(half* shmem, half *A, int m, int k, int ko) {
-    for (int i = 0; i < ((BLOCK_TILE_M * BLOCK_TILE_K) / BLOCK_SIZE) / 8; i++) {
-        int row = i * 32 + threadIdx.x / 4;
-        int col = 8 * (threadIdx.x % 4);
-        asm volatile(
-            "cp.async.ca.shared.global [%0], [%1], 16;\n"
-            ::
-            "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_K / WMMA_TILE_K) * WMMA_TILE_M * (WMMA_TILE_K)) + (col / WMMA_TILE_K) * (WMMA_TILE_M * (WMMA_TILE_K)) + (row % WMMA_TILE_M) * (WMMA_TILE_K) + col % WMMA_TILE_K)), "l"(&A[(blockIdx.x * BLOCK_TILE_M + row) * k + ko * BLOCK_TILE_K + col])
-        );
+// For a 4-stage pipeline using cp.async, we load 8 halves at a time instead of 1. 
+
+// Loads a tile of A from global memory into shared memory.
+// THREADBLOCK_M * THREADBLOCK_K
+__device__ void loadSmemA(half *smem, half *A, const int M, const int K, int ko) {
+    int thread_id = threadIdx.x + threadIdx.y * THREAD_X + threadIdx.z * THREAD_X * THREAD_Y;
+    constexpr int TURNS = (THREADBLOCK_M * THREADBLOCK_K) / THREAD_NUM / PIPELINE;
+    for (int i = 0; i < TURNS; i++) {
+        int row = i * (THREAD_NUM / THREADBLOCK_K * PIPELINE) + thread_id / (THREADBLOCK_K / PIPELINE); // i * 32 + thread_id / 4;
+        int col = thread_id % (THREADBLOCK_K / PIPELINE) * PIPELINE; // thread_id % 4 * 8
+        
+        // layout: [row_out, col_out, row_in, col_in] = [8, 2, 16, 16]
+        int row_out = row / WMMA_M; // row / 16
+        int col_out = col / WMMA_K; // col / 16
+        int row_in = row % WMMA_M; // row % 16
+        int col_in = col % WMMA_K; // col % 16
+        int smem_index = row_out * (THREADBLOCK_K * WMMA_M) + col_out * (WMMA_K * WMMA_M) + row_in * WMMA_K + col_in;
+        int A_index = (blockIdx.y * THREADBLOCK_M + row) * K + ko * THREADBLOCK_K + col;
+
+        void *ptr = (void *)(smem + smem_index);
+        uint32_t smem_ptr;
+
+        // asm: tells the compiler you're inserting inline assembly.
+        // The %0, %1, and %2 are placeholders that get filled in by the variables listed later.
+        /*
+        asm volatile ("assembly code"
+              : output operands        <-- between the first and second colon
+              : input operands         <-- between the second and third colon
+              : clobbered registers);  <-- optional
+
+        .reg .u64 smem_ptr;               // Declare temporary 64-bit register
+        cvta.to.shared.u64 smem_ptr, %1;  // Convert ptr to a shared memory address (64-bit)
+        cvt.u32.u64 %0, smem_ptr;         // Convert 64-bit to 32-bit address (required for cp.async)
+
+        "r"	General-purpose register
+        "l"	Memory operand (pointer or address)
+        "n"	Immediate constant (known at compile-time)
+        "i"	Arbitrary compile-time constant integer
+        "m"	Memory operand (dereferenced pointer)
+        */
+        asm("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
+            : "=r"(smem_ptr)
+            : "l"(ptr));
+
+        // volatile: tells the compiler not to optimize away this code, even if it seems to have no effect. This is critical for operations with side effects like memory loads/stores.
+        
+        /*
+        cp.async.cg.shared.global [dst_shared_ptr], [src_global_ptr], size_in_bytes;
+        
+        cp.async: "copy asynchronous" — performs data movement using the async pipeline.
+        .cg: Cache Global — use the global memory cache path (i.e., via L2).
+        .shared.global: Specifies source and destination: from global to shared memory.
+        */
+        asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n"
+                     :                           // no output
+                     : "r"(smem_ptr),            // input operand 0
+                       "l"(&A[A_index]),          // input operand 1
+                       "n"(16));                 // input operand 2
     }
 }
 
-__device__ void loadShmemB(half* shmem, half *B, int k, int n, int ko) {
-    for (int i = 0; i < (BLOCK_TILE_K * BLOCK_TILE_N) / (WARP_SIZE * WARP_NUM) / 2; i++) {
-        int row = i * 2 + threadIdx.x / 64;
-        int col = 2 * (threadIdx.x % 64);
-        asm volatile(
-            "cp.async.ca.shared.global [%0], [%1], 4;\n"
-            ::
-            "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_K) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_K * (WMMA_TILE_N)) + (col / WMMA_TILE_N) * (WMMA_TILE_K * (WMMA_TILE_N)) + (row % WMMA_TILE_K) * (WMMA_TILE_N) + col % (WMMA_TILE_N))), "l"(&B[(ko * BLOCK_TILE_K + row) * n + blockIdx.y * BLOCK_TILE_N + col])
-        );                
+// Loads a tile of B from global memory into shared memory.
+// THREADBLOCK_N * THREADBLOCK_K
+__device__ void loadSmemB(half *smem, half *B, const int N, const int K, int ko) {
+    int thread_id = threadIdx.x + threadIdx.y * THREAD_X + threadIdx.z * THREAD_X * THREAD_Y;
+    constexpr int TURNS = (THREADBLOCK_N * THREADBLOCK_K) / THREAD_NUM / PIPELINE;
+    for (int i = 0; i < TURNS; i++) {
+        int row = i * (THREAD_NUM / THREADBLOCK_K * PIPELINE) + thread_id / (THREADBLOCK_K / PIPELINE); // i * 32 + thread_id / 4;
+        int col = thread_id % (THREADBLOCK_K / PIPELINE) * PIPELINE; // thread_id % 4 * 8
+        
+        // layout: [row_out, col_out, row_in, col_in] = [8, 2, 16, 16]
+        int row_out = row / WMMA_N; // row / 16
+        int col_out = col / WMMA_K; // col / 16
+        int row_in = row % WMMA_N; // row % 16
+        int col_in = col % WMMA_K; // col % 16
+        int smem_index = row_out * (THREADBLOCK_K * WMMA_N) + col_out * (WMMA_K * WMMA_N) + row_in * WMMA_K + col_in;
+        int B_index = (blockIdx.x * THREADBLOCK_N + row) * K + ko * THREADBLOCK_K + col;
+
+        void *ptr = (void *)(smem + smem_index);
+        uint32_t smem_ptr;
+
+        asm("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
+            : "=r"(smem_ptr)
+            : "l"(ptr));
+
+        asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n"
+                     :                           // no output
+                     : "r"(smem_ptr),            // input operand 0
+                       "l"(&B[B_index]),          // input operand 1
+                       "n"(16));                 // input operand 2
     }
 }
 
-__device__ void loadFragA_mma(uint32_t* frag, half *shmem, int ki) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
-    uint32_t lane_id = threadIdx.x % WARP_SIZE;
-    for (int i = 0; i < 4; i++) {       // Warp do 64x16, 16x16 a time, so 4 times
-        // for (int j = 0; j < 4; j++) {   // for every 16x16, every thread load 4 1x2 data
-        //     int row = warp_id_x * WARP_TILE_M + i * WMMA_TILE_M + (j / 2) * 8 + (lane_id / 4);
-        //     int col = ki * WMMA_TILE_K + (j % 2) * 8 + (lane_id % 4) * 2;
-        //     frag[i * 4 + j] = *(uint32_t*)(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_K / WMMA_TILE_K) * WMMA_TILE_M * (WMMA_TILE_K)) + (col / WMMA_TILE_K) * (WMMA_TILE_M * (WMMA_TILE_K)) + (row % WMMA_TILE_M) * (WMMA_TILE_K) + col % WMMA_TILE_K);
-        // }
-        int row = warp_id_x * WARP_TILE_M + i * 16 + (lane_id % 16);
-        int col = ki * WARP_TILE_K + (lane_id / 16) * 8;
-        asm volatile (
-            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-            : "=r"(frag[i * 4]), "=r"(frag[i * 4 + 1]), "=r"(frag[i * 4 + 2]), "=r"(frag[i * 4 + 3])
-            : "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_K / WMMA_TILE_K) * WMMA_TILE_M * (WMMA_TILE_K)) + (col / WMMA_TILE_K) * (WMMA_TILE_M * (WMMA_TILE_K)) + (row % WMMA_TILE_M) * (WMMA_TILE_K) + col % WMMA_TILE_K))
-        );
+// Stores a tile of C from shared memory into global memory.
+// THREADBLOCK_M * THREADBLOCK_N
+__device__ void storeSmemC(half *C, float *smem, const int M, const int N) {
+    int thread_id = threadIdx.x + threadIdx.y * THREAD_X + threadIdx.z * THREAD_X * THREAD_Y;
+    constexpr int TURNS = (THREADBLOCK_M * THREADBLOCK_N) / THREAD_NUM;
+    for (int i = 0; i < TURNS; i++) {
+        int row = i * (THREAD_NUM / THREADBLOCK_N) + thread_id / THREADBLOCK_N; // i
+        int col = thread_id % THREADBLOCK_N; // thread_id
+        
+        // layout: [row_out, col_out, row_in, col_in] = [8, 8, 16, 16]
+        int row_out = row / WMMA_M; // row / 16
+        int col_out = col / WMMA_N; // col / 16
+        int row_in = row % WMMA_M; // row % 16
+        int col_in = col % WMMA_N; // col % 16
+        int smem_index = row_out * (THREADBLOCK_N * WMMA_M) + col_out * (WMMA_N * WMMA_M) + row_in * WMMA_N + col_in;
+        int C_index = (blockIdx.y * THREADBLOCK_M + row) * N + blockIdx.x * THREADBLOCK_N + col;
+
+        C[C_index] = __float2half(smem[smem_index]);
     }
 }
 
-__device__ void loadFragB_mma(uint32_t* frag, half *shmem, int ki) {
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
-    uint32_t lane_id = threadIdx.x % WARP_SIZE;
-    // for (int i = 0; i < 8; i++) {       // Warp do 16x64, 16x8 a time, so 8 times
-    //     for (int j = 0; j < 2; j++) {   // for every 16x8, every thread load 2 1x2 data
-    //         int row = ki * WARP_TILE_K + j * 8 + (lane_id / 4);
-    //         int col = warp_id_y * WARP_TILE_N + i * 8 + (lane_id % 4) * 2;
-    //         frag[i * 2 + j] = *(uint32_t*)(shmem + (row / WMMA_TILE_K) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_K * (WMMA_TILE_N)) + (col / WMMA_TILE_N) * (WMMA_TILE_K * (WMMA_TILE_N)) + (row % WMMA_TILE_K) * (WMMA_TILE_N) + col % (WMMA_TILE_N));
-    //     }
-    //     // Can directly use ldmatrix.trans
-    //     asm volatile ("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(frag[i * 2]) : "r"(frag[i * 2]));
-    //     asm volatile ("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(frag[i * 2 + 1]) : "r"(frag[i * 2]));
-    // }
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        int row = ki * WARP_TILE_K + (lane_id % 16);
-        int col = warp_id_y * WARP_TILE_N + i * 16 + (lane_id / 16) * 8;
-        asm volatile (
-            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-            : "=r"(frag[i * 4]), "=r"(frag[i * 4 + 1]), "=r"(frag[i * 4 + 2]), "=r"(frag[i * 4 + 3])
-            : "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_K) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_K * (WMMA_TILE_N)) + (col / WMMA_TILE_N) * (WMMA_TILE_K * (WMMA_TILE_N)) + (row % WMMA_TILE_K) * (WMMA_TILE_N) + col % (WMMA_TILE_N)))
-        );
+// Loads a subtile of As from shared memory to fragment. 
+// WARP_M * WARP_K
+__device__ void loadFragA(nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::row_major> *frag, half *smem, int ki) {
+    for (int i = 0; i < FRAG_A_SIZE; i++) {
+        int row = threadIdx.z * WARP_M + i * WMMA_M;
+        int col = ki * WMMA_K;
+        // layout: [8, 2, 16, 16]
+        int row_out = row / WMMA_M; // row / 16
+        int col_out = col / WMMA_K; // col / 16
+        int row_in = row % WMMA_M; // row % 16
+        int col_in = col % WMMA_K; // col % 16
+        int smem_index = row_out * (THREADBLOCK_K * WMMA_M) + col_out * (WMMA_K * WMMA_M) + row_in * WMMA_K + col_in;
+        // wmma::load_matrix_sync(fragment, smem_ptr, stride)
+        // smem_ptr: pointer to start of tile
+        // stride: leading dimension in memory
+        nvcuda::wmma::load_matrix_sync(frag[i], smem + smem_index, WMMA_M);
     }
 }
 
-__device__ void compute_mma(uint32_t* A, uint32_t* B, uint32_t* C) {
-    asm volatile (
-        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1},{%2,%3,%4,%5},{%6,%7},{%8,%9};\n"
-        : "=r"(C[0]), "=r"(C[1])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
-          "r"(B[0]), "r"(B[1]),
-          "r"(C[0]), "r"(C[1])
-    );
-    asm volatile (
-        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1},{%2,%3,%4,%5},{%6,%7},{%8,%9};\n"
-        : "=r"(C[2]), "=r"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
-          "r"(B[2]), "r"(B[3]),
-          "r"(C[2]), "r"(C[3])
-    );
+// Loads a subtile of Bs from shared memory to fragment. 
+// WARP_N * WARP_K
+__device__ void loadFragB(nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::col_major> *frag, half *smem, int ki) {
+    for (int i = 0; i < FRAG_B_SIZE; i++) {
+        int row = threadIdx.y * WARP_N + i * WMMA_N;
+        int col = ki * WMMA_K;
+        // layout: [8, 2, 16, 16]
+        int row_out = row / WMMA_N; // row / 16
+        int col_out = col / WMMA_K; // col / 16
+        int row_in = row % WMMA_N; // row % 16
+        int col_in = col % WMMA_K; // col % 16
+        int smem_index = row_out * (THREADBLOCK_K * WMMA_N) + col_out * (WMMA_K * WMMA_N) + row_in * WMMA_K + col_in;
+        // wmma::load_matrix_sync(fragment, smem_ptr, stride)
+        // smem_ptr: pointer to start of tile
+        // stride: leading dimension in memory
+        nvcuda::wmma::load_matrix_sync(frag[i], smem + smem_index, WMMA_N);
+    }
 }
 
-__device__ void storeFragC_mma(half* shmem, uint32_t* frag) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
-    uint32_t lane_id = threadIdx.x % WARP_SIZE;
-    for (int i = 0; i < 4; i++) {           // 4 rows
-        for (int j = 0; j < 8; j++) {       // 8 cols
-            for (int k = 0; k < 2; k++) {   // 2 frags
-                int row = warp_id_x * WARP_TILE_M + i * WMMA_TILE_M + k * 8 + (lane_id / 4);
-                int col = warp_id_y * WARP_TILE_N + j * 8 + (lane_id % 4) * 2;
-                *(uint32_t*)(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_M * WMMA_TILE_N) + (col / WMMA_TILE_N) * (WMMA_TILE_M * WMMA_TILE_N) + (row % WMMA_TILE_M) * (WMMA_TILE_N) + (col % WMMA_TILE_N)) = 
-                frag[i * 8 * 2 + j * 2 + k];
-            }
+// Stores a subtile of Cs from fragment to shared memory. 
+// WARP_M * WARP_N
+__device__ void storeFragC(nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> *frag, float *smem) {
+    for (int i = 0; i < FRAG_A_SIZE; i++) {
+        for (int j = 0; j < FRAG_B_SIZE; j++) {
+            int row = threadIdx.z * WARP_M + i * WMMA_M;
+            int col = threadIdx.y * WARP_N + j * WMMA_N;
+            // layout: [8, 8, 16, 16]
+            int row_out = row / WMMA_M; // row / 16
+            int col_out = col / WMMA_N; // col / 16
+            int row_in = row % WMMA_M; // row % 16
+            int col_in = col % WMMA_N; // col % 16
+            int smem_index = row_out * (THREADBLOCK_N * WMMA_M) + col_out * (WMMA_N * WMMA_M) + row_in * WMMA_N + col_in;
+            int frag_index = i * FRAG_B_SIZE + j;
+            // wmma::load_matrix_sync(smem_ptr, fragment, stride, layout)
+            // smem_ptr: pointer to start of tile
+            // stride: leading dimension in memory
+            // layout: mem_row_major or mem_col_major
+            nvcuda::wmma::store_matrix_sync(smem + smem_index, frag[frag_index], WMMA_M, nvcuda::wmma::mem_row_major);
         }
     }
 }
 
-__device__ void storeShmemC(half *C, half* shmem, int m, int n) {
-    for (int i = 0; i < (BLOCK_TILE_M * BLOCK_TILE_N) / (WARP_SIZE * WARP_NUM); i++) {
-        int row = i * ((WARP_SIZE * WARP_NUM) / BLOCK_TILE_M) + threadIdx.x / BLOCK_TILE_N;
-        int col = threadIdx.x % BLOCK_TILE_N;
-        C[(blockIdx.x * BLOCK_TILE_M + row) * n + (blockIdx.y * BLOCK_TILE_N + col)] = 
-        shmem[(row / WMMA_TILE_M) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_M * WMMA_TILE_N) + (col / WMMA_TILE_N) * (WMMA_TILE_M * WMMA_TILE_N) + (row % WMMA_TILE_M) * (WMMA_TILE_N) + col % WMMA_TILE_N];
+// C = alpha * A * B^T + beta * C
+// A: M*K, B: N*K, C: M*N
+// Test performance using shape M=5376, N=5376, K=2048
+__global__ void gemm_kernel(half *A, half *B, half *C, const int M, const int N, const int K) {
+    // extern: the size is not defined here, but will be specified when launching the kernel.
+    // __shared__: indicates that the variable resides in shared memory, accessible to all threads in the same block.
+    // uint8_t: defines a byte-level buffer (uint8_t = 1 byte), which gives you full control over how to split the memory into subregions.
+    extern __shared__ uint8_t shared_storage[];
+
+    // half: 16-bit floating point data type (FP-16), <cuda_fp16.h>. Tensor Cores natively support FP16 arithmetic.
+    // reinterpret_cast<TYPE *>: Treat the memory at this address as a pointer to TYPE, even if it's not originally that type.
+    // 4-stage pipeline
+    half *As1 = reinterpret_cast<half *>(shared_storage);
+    half *As2 = As1 + THREADBLOCK_M * THREADBLOCK_K;
+    half *As3 = As2 + THREADBLOCK_M * THREADBLOCK_K;
+    half *As4 = As3 + THREADBLOCK_M * THREADBLOCK_K;
+    half *Bs1 = As4 + THREADBLOCK_N * THREADBLOCK_K;
+    half *Bs2 = Bs1 + THREADBLOCK_N * THREADBLOCK_K;
+    half *Bs3 = Bs2 + THREADBLOCK_N * THREADBLOCK_K;
+    half *Bs4 = Bs3 + THREADBLOCK_N * THREADBLOCK_K;
+    // half * half = float
+    float *Cs = reinterpret_cast<float *>(shared_storage);
+
+    // fragment: a small, structured piece of a matrix — like a tile — that is used as input or output to Tensor Core operations.
+    // nvcuda::wmma::fragment<role, M, N, K, data_type, layout>
+    // Role: matrix_a, matrix_b or accumulator
+    // M, N, K: fragment size
+    // data_type: usually half for inputs, float for accumulator
+    // layout: row_major or col_major
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::row_major> Af[FRAG_A_SIZE];
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::col_major> Bf[FRAG_B_SIZE];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> Cf[FRAG_A_SIZE * FRAG_B_SIZE];
+    
+    // initialize Cf
+    for (int row = 0; row < FRAG_A_SIZE; row++) {
+        for (int col = 0; col < FRAG_B_SIZE; col++) {
+            nvcuda::wmma::fill_fragment(Cf[row * FRAG_B_SIZE + col], 0.0f);
+        }
     }
-}
 
-__global__ void gemm_kernel(
-    half* _input,
-    half* _w,
-    half* _o,
-    int M, int N, int K
-)
-{
-    extern __shared__ uint8_t shmem[];
-    half *A1 = reinterpret_cast<half*>(shmem);
-    half *B1 = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
-    half *C_buf = reinterpret_cast<half*>(shmem);
+    // prologue
+    loadSmemA(As1, A, M, K, 0);
+    loadSmemB(Bs1, B, N, K, 0);
+    // tells the GPU that all the cp.async operations you just issued belong to a group, and that group is now done issuing commands.
+    asm volatile("cp.async.commit_group;\n" ::);
 
-    uint32_t A_frags[16];
-    uint32_t B_frags[16];
-    uint32_t C_frags[64] = {0};
+    loadSmemA(As2, A, M, K, 1);
+    loadSmemB(Bs2, B, N, K, 1);
+    asm volatile("cp.async.commit_group;\n" ::);
 
-    for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
-        loadShmemA(A1, _input, M, K, ko); // cp.async
-        loadShmemB(B1, _w, K, N, ko);
-        asm volatile("cp.async.wait_all;\n"::);
+    loadSmemA(As3, A, M, K, 2);
+    loadSmemB(Bs3, B, N, K, 2);
+    asm volatile("cp.async.commit_group;\n" ::);
+
+    int K_THREADBLOCK_COUNT = K / THREADBLOCK_K; // 64
+    for (int ko = 0; ko < K_THREADBLOCK_COUNT - 4; ko += 4) {
+        // Wait until 2 previously committed async copy groups have finished.
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
-            loadFragA_mma(A_frags, A1, ki);
-            loadFragB_mma(B_frags, B1, ki);
-            for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
-                for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
-                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+        if (ko + 3 < K_THREADBLOCK_COUNT) {
+            loadSmemA(As4, A, M, K, ko + 3);
+            loadSmemB(Bs4, B, N, K, ko + 3);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < K_WARP_COUNT; ki++) {
+            loadFragA(Af, As1, ki);
+            loadFragB(Bf, Bs1, ki);
+            for (int i = 0; i < M_WMMA_COUNT; i++) {
+                for (int j = 0; j < N_WMMA_COUNT; j++) {
+                    int Cf_index = i * N_WMMA_COUNT + j;
+                    // nvcuda::wmma::mma_sync(result, A, B, accum)
+                    // result = A * B + accum
+                    nvcuda::wmma::mma_sync(Cf[Cf_index], Af[i], Bf[j], Cf[Cf_index]);
                 }
             }
         }
+
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
+        if (ko + 4 < K_THREADBLOCK_COUNT) {
+            loadSmemA(As1, A, M, K, ko + 4);
+            loadSmemB(Bs1, B, N, K, ko + 4);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < K_WARP_COUNT; ki++) {
+            loadFragA(Af, As2, ki);
+            loadFragB(Bf, Bs2, ki);
+            for (int i = 0; i < M_WMMA_COUNT; i++) {
+                for (int j = 0; j < N_WMMA_COUNT; j++) {
+                    int Cf_index = i * N_WMMA_COUNT + j;
+                    // nvcuda::wmma::mma_sync(result, A, B, accum)
+                    // result = A * B + accum
+                    nvcuda::wmma::mma_sync(Cf[Cf_index], Af[i], Bf[j], Cf[Cf_index]);
+                }
+            }
+        }
+
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
+        __syncthreads();
+        if (ko + 5 < K_THREADBLOCK_COUNT) {
+            loadSmemA(As2, A, M, K, ko + 5);
+            loadSmemB(Bs2, B, N, K, ko + 5);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < K_WARP_COUNT; ki++) {
+            loadFragA(Af, As3, ki);
+            loadFragB(Bf, Bs3, ki);
+            for (int i = 0; i < M_WMMA_COUNT; i++) {
+                for (int j = 0; j < N_WMMA_COUNT; j++) {
+                    int Cf_index = i * N_WMMA_COUNT + j;
+                    // nvcuda::wmma::mma_sync(result, A, B, accum)
+                    // result = A * B + accum
+                    nvcuda::wmma::mma_sync(Cf[Cf_index], Af[i], Bf[j], Cf[Cf_index]);
+                }
+            }
+        }
+
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
+        __syncthreads();
+        if (ko + 6 < K_THREADBLOCK_COUNT) {
+            loadSmemA(As3, A, M, K, ko + 6);
+            loadSmemB(Bs3, B, N, K, ko + 6);
+            //asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < K_WARP_COUNT; ki++) {
+            loadFragA(Af, As4, ki);
+            loadFragB(Bf, Bs4, ki);
+            for (int i = 0; i < M_WMMA_COUNT; i++) {
+                for (int j = 0; j < N_WMMA_COUNT; j++) {
+                    int Cf_index = i * N_WMMA_COUNT + j;
+                    // nvcuda::wmma::mma_sync(result, A, B, accum)
+                    // result = A * B + accum
+                    nvcuda::wmma::mma_sync(Cf[Cf_index], Af[i], Bf[j], Cf[Cf_index]);
+                }
+            }
+        }
     }
-    storeFragC_mma(C_buf, C_frags);
+    {
+        int ko = (K_THREADBLOCK_COUNT / 4 - 1) * 4;
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
+        __syncthreads();
+        if (ko + 3 < K_THREADBLOCK_COUNT) {
+            loadSmemA(As4, A, M, K, ko + 3);
+            loadSmemB(Bs4, B, N, K, ko + 3);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < K_WARP_COUNT; ki++) {
+            loadFragA(Af, As1, ki);
+            loadFragB(Bf, Bs1, ki);
+            for (int i = 0; i < M_WMMA_COUNT; i++) {
+                for (int j = 0; j < N_WMMA_COUNT; j++) {
+                    int Cf_index = i * N_WMMA_COUNT + j;
+                    // nvcuda::wmma::mma_sync(result, A, B, accum)
+                    // result = A * B + accum
+                    nvcuda::wmma::mma_sync(Cf[Cf_index], Af[i], Bf[j], Cf[Cf_index]);
+                }
+            }
+        }
+
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
+        __syncthreads();
+        if (ko + 4 < K_THREADBLOCK_COUNT) {
+            loadSmemA(As1, A, M, K, ko + 4);
+            loadSmemB(Bs1, B, N, K, ko + 4);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < K_WARP_COUNT; ki++) {
+            loadFragA(Af, As2, ki);
+            loadFragB(Bf, Bs2, ki);
+            for (int i = 0; i < M_WMMA_COUNT; i++) {
+                for (int j = 0; j < N_WMMA_COUNT; j++) {
+                    int Cf_index = i * N_WMMA_COUNT + j;
+                    // nvcuda::wmma::mma_sync(result, A, B, accum)
+                    // result = A * B + accum
+                    nvcuda::wmma::mma_sync(Cf[Cf_index], Af[i], Bf[j], Cf[Cf_index]);
+                }
+            }
+        }
+
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(1));
+        __syncthreads();
+        if (ko + 5 < K_THREADBLOCK_COUNT) {
+            loadSmemA(As2, A, M, K, ko + 5);
+            loadSmemB(Bs2, B, N, K, ko + 5);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < K_WARP_COUNT; ki++) {
+            loadFragA(Af, As3, ki);
+            loadFragB(Bf, Bs3, ki);
+            for (int i = 0; i < M_WMMA_COUNT; i++) {
+                for (int j = 0; j < N_WMMA_COUNT; j++) {
+                    int Cf_index = i * N_WMMA_COUNT + j;
+                    // nvcuda::wmma::mma_sync(result, A, B, accum)
+                    // result = A * B + accum
+                    nvcuda::wmma::mma_sync(Cf[Cf_index], Af[i], Bf[j], Cf[Cf_index]);
+                }
+            }
+        }
+
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(0));
+        __syncthreads();
+        if (ko + 6 < K_THREADBLOCK_COUNT) {
+            loadSmemA(As3, A, M, K, ko + 6);
+            loadSmemB(Bs3, B, N, K, ko + 6);
+        }
+        for (int ki = 0; ki < K_WARP_COUNT; ki++) {
+            loadFragA(Af, As4, ki);
+            loadFragB(Bf, Bs4, ki);
+            for (int i = 0; i < M_WMMA_COUNT; i++) {
+                for (int j = 0; j < N_WMMA_COUNT; j++) {
+                    int Cf_index = i * N_WMMA_COUNT + j;
+                    // nvcuda::wmma::mma_sync(result, A, B, accum)
+                    // result = A * B + accum
+                    nvcuda::wmma::mma_sync(Cf[Cf_index], Af[i], Bf[j], Cf[Cf_index]);
+                }
+            }
+        }
+    }
+    storeFragC(Cf, Cs);
     __syncthreads();
-    storeShmemC(_o, C_buf, M, N);   
+    storeSmemC(C, Cs, M, N);
 }
 
 torch::Tensor gemm(
