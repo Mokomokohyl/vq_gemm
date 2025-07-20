@@ -69,6 +69,7 @@ def main():
         torch.cuda.synchronize()
 
         output_cuda = module.e2e_gemm(input, w, codebook)
+        torch.cuda.synchronize()
 
         output_ref = vq_gemm_reference(input, w, codebook)
 

@@ -9,16 +9,6 @@
 #include "mma.h"
 #include <random>
 
-// Size constants
-const int M = 4096;
-const int N = 4096;
-const int K = 4096; // K should be at least 128 for a 4-stage pipeline
-constexpr int N_Q = N;
-constexpr int K_Q = K / 2;
-const int THREAD_X_DEQ = 32;
-const int THREAD_Y_DEQ = 32;
-const int CODEBOOK_SIZE = 256;
-
 // thread block tile size: 128*128*32 (2*2 warps)
 const int THREADBLOCK_M = 128;
 const int THREADBLOCK_N = 128;
@@ -43,8 +33,6 @@ constexpr int FRAG_B_SIZE = WARP_N / WMMA_N; // 4
 constexpr int K_WARP_COUNT = THREADBLOCK_K / WARP_K; // 2
 constexpr int M_WMMA_COUNT = WARP_M / WMMA_M; // 4
 constexpr int N_WMMA_COUNT = WARP_N / WMMA_N; // 4
-const int WARM_UP_COUNT = 50;
-const int ITERATION_COUNT = 100;
 // 4-stage pipeline multiplier
 const int PIPELINE = 8; // 16 bytes = 8 halves
 
