@@ -39,12 +39,12 @@
 // for dequant kernel
 #define DQ_BLOCK_SIZE 1024
 #define DQ_BLOCK_TILE_N 128
-#define DQ_BLOCK_TILE_KI 32
+#define DQ_BLOCK_TILE_M 32
 
 // A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
 #define MAX_SHARED_MEMORY_USAGE (16384 + CODEBOOK_BUFFERING * (32768 / HOT))
 // uint8(1) -> half(2) + codebook
-#define DEQUANT_SHARED_MEMORY_USAGE (DQ_BLOCK_TILE_N * DQ_BLOCK_TILE_KI * RATIO * 2 + DQ_BLOCK_TILE_N / 4 * ENTRY * RATIO * 2)
+#define DEQUANT_SHARED_MEMORY_USAGE (DQ_BLOCK_TILE_N * DQ_BLOCK_TILE_M * RATIO * 2 + DQ_BLOCK_TILE_N / 4 * ENTRY * RATIO * 2)
 #define GEMM_SHARED_MEMORY_USAGE (BLOCK_TILE_M * BLOCK_TILE_K * 2 + BLOCK_TILE_K * RATIO * BLOCK_TILE_N * 2)
 __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     uint32_t addr;
@@ -264,7 +264,7 @@ torch::Tensor gemm(
     return o;
 }
 
-// 32 x 128 uint8, each thread dequant 4 uint8 per iter
+// each threadBlock load 32 x 128 uint8, each thread dequant 4 uint8 
 __global__ void dequant_kernel(
     uint8_t* Bq, // [K, N]
     half* _codebook, // [N / 4, ENTRY * RATIO]
@@ -276,39 +276,48 @@ __global__ void dequant_kernel(
     uint8_t indice[4];
     half* B_buf = reinterpret_cast<half*>(shmem);
     // codebook size: [DQ_BLOCK_TILE_N / 4 (=32) ,ENTRY * RATIO] (RATIO = 2)
-    half* codebook_buf = reinterpret_cast<half*>(shmem + DQ_BLOCK_TILE_KI * DQ_BLOCK_TILE_N * RATIO * 2);
+    half* codebook_buf = reinterpret_cast<half*>(shmem + DQ_BLOCK_TILE_M * DQ_BLOCK_TILE_N * RATIO * 2);
     uint32_t Brow = threadIdx.x % 32; // [0, 31]
     uint32_t Bcol = (threadIdx.x / 32) * 4; // 4 * [0, 31]
     // Load Codebook to shmem
 
-    uint32_t codebook_begin_row = blockIdx.x * DQ_BLOCK_TILE_N / 4;
+    uint32_t codebook_begin_row = blockIdx.y * DQ_BLOCK_TILE_N / 4;
     // uint32_t iters_to_load = ((32 * ENTRY * RATIO) / 8) / BLOCK_SIZE; // = 2
     uint32_t load_cols = (ENTRY * RATIO) / 8; // =64
     uint32_t load_rows = DQ_BLOCK_SIZE / load_cols; // =16
-    *(int4*)(&codebook_buf[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
-    *(int4*)(&_codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
 
-    *(int4*)(&codebook_buf[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
-    *(int4*)(&_codebook[(codebook_begin_row + load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
+    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n"
+    :
+    : "r"(shmem_uint32_t(&codebook_buf[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])),
+        "l"(&_codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
+    );
+    // *(int4*)(&codebook_buf[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
+    // *(int4*)(&_codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
 
+    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n"
+    :
+    : "r"(shmem_uint32_t(&codebook_buf[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])),
+        "l"(&_codebook[(codebook_begin_row + load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
+    );
+    // *(int4*)(&codebook_buf[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
+    // *(int4*)(&_codebook[(codebook_begin_row + load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
+
+    asm volatile("cp.async.wait_all;\n"::);
+    __syncthreads();
 
     half* codebook_line = codebook_buf + (Bcol / 4) * ENTRY * RATIO;
-    for (int i = 0; i < K / DQ_BLOCK_TILE_KI; i++) {
 
-        __syncthreads();
-        // Load Bq indice to reg.
-        *(uint32_t*)(&indice[0]) = *(uint32_t*)(&Bq[(i * DQ_BLOCK_TILE_KI + Brow) * N + blockIdx.x * DQ_BLOCK_TILE_N + Bcol]);
+    // Load Bq indice to reg.
+    *(uint32_t*)(&indice[0]) = *(uint32_t*)(&Bq[(Brow + blockIdx.x * DQ_BLOCK_TILE_M) * N + blockIdx.y * DQ_BLOCK_TILE_N + Bcol]);
 
-        // dequant and write to Shmem
-        *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 0) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[0]) * RATIO]);
-        *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 1) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[1]) * RATIO]);
-        *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 2) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[2]) * RATIO]);
-        *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 3) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[3]) * RATIO]);
+    // dequant and write to HBM
+    *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 0) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[0]) * RATIO]);
+    *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 1) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[1]) * RATIO]);
+    *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 2) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[2]) * RATIO]);
+    *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 3) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[3]) * RATIO]);
 
-        __syncthreads();
-        // write back to HBM
-        *(int4*)(&B[(i * DQ_BLOCK_TILE_KI + Brow) * N * RATIO + (blockIdx.x * DQ_BLOCK_TILE_N + Bcol) * RATIO]) = *(int4*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol) * RATIO]);
-    }
+    // write back to HBM
+    *(int4*)(&B[(Brow + blockIdx.x * DQ_BLOCK_TILE_M) * N * RATIO + (blockIdx.y * DQ_BLOCK_TILE_N + Bcol) * RATIO]) = *(int4*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol) * RATIO]);
 }
 
 torch::Tensor e2e_gemm(
@@ -345,7 +354,7 @@ torch::Tensor e2e_gemm(
     dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
     dim3 block(BLOCK_SIZE); // = 128
     // For dequant kernel
-    dim3 dq_grid(N / DQ_BLOCK_TILE_N); // 4096 / 128 blocks. split on N
+    dim3 dq_grid(M / DQ_BLOCK_TILE_M, N / DQ_BLOCK_TILE_N); // 4096 / 128 blocks. split on N
     dim3 dq_block(DQ_BLOCK_SIZE); // = 1024
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
