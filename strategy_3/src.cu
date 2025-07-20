@@ -367,13 +367,13 @@ torch::Tensor e2e_gemm(
             o_ptr,
             M, N, K
         );
-    CHECK_LAST_CUDA_ERROR();
 #if PROFILING == 1
     }
     cudaEventRecord(ed);
     cudaEventSynchronize(ed);
     float ms;
     cudaEventElapsedTime(&ms, st, ed);
+    CHECK_LAST_CUDA_ERROR();
     std::cout << "Latency: " << ms / (1.0 * iter) << std::endl;
     std::cout << "TFLOPS : " << ((2.0 * M * N * K * RATIO) / ((ms / (1.0 * iter)) / (1000.0))) / (1024.0 * 1024.0 * 1024.0 * 1024.0) << std::endl;
 #endif

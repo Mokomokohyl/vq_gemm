@@ -39,7 +39,7 @@ const int PIPELINE = 8; // 16 bytes = 8 halves
 // Kernel to dequantize B_q using a codebook and write to B.
 // Each input index produces two half-precision outputs.
 
-#define PROFILING 1
+#define PROFILING 0
 #define WARP_NUM 4
 #define WARP_SIZE 32
 #define BLOCK_SIZE (WARP_NUM * WARP_SIZE)
@@ -72,10 +72,24 @@ const int PIPELINE = 8; // 16 bytes = 8 halves
 #define DQ_BLOCK_TILE_KI 32
 
 // A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
-#define MAX_SHARED_MEMORY_USAGE ((THREADBLOCK_M + THREADBLOCK_N) * THREADBLOCK_K * sizeof(half) + THREADBLOCK_M * THREADBLOCK_N * sizeof(float) + CODEBOOK_BUFFERING * (32768 / HOT))
+// #define MAX_SHARED_MEMORY_USAGE ((THREADBLOCK_M + THREADBLOCK_N) * THREADBLOCK_K * sizeof(half) + THREADBLOCK_M * THREADBLOCK_N * sizeof(float) + CODEBOOK_BUFFERING * (32768 / HOT))
+#define MAX_SHARED_MEMORY_USAGE ((THREADBLOCK_M + THREADBLOCK_N) * THREADBLOCK_K * sizeof(half) * 4)
 // uint8(1) -> half(2) + codebook
 #define DEQUANT_SHARED_MEMORY_USAGE (DQ_BLOCK_TILE_N * DQ_BLOCK_TILE_KI * RATIO * 2 + DQ_BLOCK_TILE_N / 4 * ENTRY * RATIO * 2)
-#define GEMM_SHARED_MEMORY_USAGE (BLOCK_TILE_M * BLOCK_TILE_K * 2 + BLOCK_TILE_K * RATIO * BLOCK_TILE_N * 2)
+
+#define CHECK_LAST_CUDA_ERROR() checkLast(__FILE__, __LINE__)
+void checkLast(const char* const file, const int line)
+{
+    cudaError_t const err{cudaGetLastError()};
+    if (err != cudaSuccess)
+    {
+        std::cerr << "CUDA Runtime Error at: " << file << ":" << line
+                  << std::endl;
+        std::cerr << cudaGetErrorString(err) << std::endl;
+        // We don't exit when we encounter CUDA errors in this example.
+        // std::exit(EXIT_FAILURE);
+    }
+}
 
 // For a 4-stage pipeline using cp.async, we load 8 halves at a time instead of 1. 
 
@@ -212,7 +226,7 @@ __device__ void loadFragA(nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M,
 
 // Loads a subtile of Bs from shared memory to fragment. 
 // WARP_N * WARP_K
-__device__ void loadFragB(nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::col_major> *frag, half *smem, int ki) {
+__device__ void loadFragB(nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::row_major> *frag, half *smem, int ki) {
     for (int i = 0; i < FRAG_B_SIZE; i++) {
         int row = threadIdx.y * WARP_N + i * WMMA_N;
         int col = ki * WMMA_K;
@@ -255,7 +269,7 @@ __device__ void storeFragC(nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMM
 // C = alpha * A * B^T + beta * C
 // A: M*K, B: N*K, C: M*N
 // Test performance using shape M=5376, N=5376, K=2048
-__global__ void gemm_kernel(half *A, half *B, half *C, const int M, const int N, const int K) {
+__global__ void gemm_kernel(half *A, half *B, half *C, int M, int N, int K) {
     // extern: the size is not defined here, but will be specified when launching the kernel.
     // __shared__: indicates that the variable resides in shared memory, accessible to all threads in the same block.
     // uint8_t: defines a byte-level buffer (uint8_t = 1 byte), which gives you full control over how to split the memory into subregions.
@@ -268,7 +282,7 @@ __global__ void gemm_kernel(half *A, half *B, half *C, const int M, const int N,
     half *As2 = As1 + THREADBLOCK_M * THREADBLOCK_K;
     half *As3 = As2 + THREADBLOCK_M * THREADBLOCK_K;
     half *As4 = As3 + THREADBLOCK_M * THREADBLOCK_K;
-    half *Bs1 = As4 + THREADBLOCK_N * THREADBLOCK_K;
+    half *Bs1 = As4 + THREADBLOCK_M * THREADBLOCK_K;
     half *Bs2 = Bs1 + THREADBLOCK_N * THREADBLOCK_K;
     half *Bs3 = Bs2 + THREADBLOCK_N * THREADBLOCK_K;
     half *Bs4 = Bs3 + THREADBLOCK_N * THREADBLOCK_K;
@@ -282,7 +296,7 @@ __global__ void gemm_kernel(half *A, half *B, half *C, const int M, const int N,
     // data_type: usually half for inputs, float for accumulator
     // layout: row_major or col_major
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::row_major> Af[FRAG_A_SIZE];
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::col_major> Bf[FRAG_B_SIZE];
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::row_major> Bf[FRAG_B_SIZE];
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> Cf[FRAG_A_SIZE * FRAG_B_SIZE];
     
     // initialize Cf
@@ -522,6 +536,7 @@ torch::Tensor gemm(
             o_ptr,
             M, N, K
         );
+        CHECK_LAST_CUDA_ERROR();
 #if PROFILING == 1
     }
     cudaEventRecord(ed);
@@ -649,6 +664,7 @@ torch::Tensor e2e_gemm(
         );
 #if PROFILING == 1
     }
+    CHECK_LAST_CUDA_ERROR();
     cudaEventRecord(ed);
     cudaEventSynchronize(ed);
     float ms;
