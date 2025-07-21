@@ -1,5 +1,6 @@
 KERNELS ?= all
-NCU_LOG_NAME = s3_without_setmaxnreg
+NCU_LOG_NAME = s3_with_setmaxnreg
+NCU = /usr/local/cuda-12.8/bin/ncu
 
 compile:
 	KERNELS=$(KERNELS) python compile_kernels.py build_ext --inplace
@@ -28,6 +29,6 @@ try-s3:;$(MAKE) try KERNELS=s3
 run-s3:;$(MAKE) run KERNELS=s3
 run-gemm-128:; TEST_GEMM=TRUE KERNELS=s1 python bench.py > ./logs/bench_gemm_128.log 2>&1
 run-gemm-1024:; TEST_GEMM=TRUE KERNELS=s2_1024 python bench.py > ./logs/bench_gemm_1024.log 2>&1
-prof-s3:;mkdir -p ncu_reports;ncu --import-source on --set full -o ./ncu_reports/$(NCU_LOG_NAME) ./run_s3.sh > ./logs/ncu_s3.log
+prof-s3:;mkdir -p ncu_reports;rm ./ncu_reports/$(NCU_LOG_NAME).ncu-rep;$(NCU) --import-source yes --set full -o ./ncu_reports/$(NCU_LOG_NAME) ./run_s3.sh > ./logs/ncu_s3.log
 
 .PHONY: run compile try clean clean-logs try-s1 run-s1 try-s2-128 run-s2-128 try-s2-1024 run-s2-1024 try-s3 run-s3
