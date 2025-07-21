@@ -9,7 +9,9 @@ conda env with torch and matplotlib
 `make compile` compile all kernels.
 - `make try-<version>`: compile and run test of the corresponding version vq-gemm kernel.
 - `make run-<version>`: run test of the corresponding version vq-gemm kernel without compile.
-- `make run-gemm`: run benchmark of gemm in compiled `s1`
+- `make run-gemm-128`: run benchmark of gemm in compiled `s1`
+- `make run-gemm-1024`: run benchmark of gemm in compiled `s2_1024` (NOT IMPLMENTED YET)
+- `make prof-s3`: run ncu profile of s3. ncu_reports will be in `./ncu_reports` directory.
 
 Terminal outputs are redirected to ./logs/bench_<version>.log  
 Error heat map are generated in ./figures/
