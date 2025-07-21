@@ -60,6 +60,7 @@ def gemm_ref(input, w):
 
 def main():
     if profiling:
+        print(f"Enter profiling code")
         print(f"  M={M}, K={K}, N={N}, ENTRY={ENTRY}, RATIO={RATIO}")
         print(f"  Device: {device}")
         print("=" * 60)

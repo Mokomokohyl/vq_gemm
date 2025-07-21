@@ -16,11 +16,12 @@ run:
 	KERNELS=$(KERNELS) python bench.py > ./logs/bench_$(KERNELS).log 2>&1
 try:;$(MAKE) compile;$(MAKE) run
 
+prof-cmd:
+	PROFILING=TRUE python bench.py	
 profile: # revise to activate your conda env
 	mkdir -p ncu_reports
 	rm -f ./ncu_reports/$(NCU_LOG_NAME).ncu-rep
-	PROFILING=TRUE KERNELS=$(KERNELS) source $(CONDA_ACTIVATE) && conda activate $(CONDA_ENV_NAME) && cd /home/ylhuang/vq_gemm && \
-	$(NCU) --import-source yes --set full -o ./ncu_reports/$(NCU_LOG_NAME) python bench.py > ./logs/ncu_$(KERNELS)_ouptput.log
+	$(NCU) --import-source yes --set full -o ./ncu_reports/$(NCU_LOG_NAME) $(MAKE) prof-cmd > ./logs/ncu_$(KERNELS)_ouptput.log
 
 clean:
 	@rm -r build
