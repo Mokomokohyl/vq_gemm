@@ -2,6 +2,9 @@ import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+# Compile flags set. rm build/ before revise it and compile
+base_nvcc_flags = ['-O2', '-arch=sm_120a', '-lineinfo', '--maxrregcount=128']
+
 kernels_to_compile_str = os.getenv('KERNELS', 'all')
 source = {
     's1':   [
@@ -25,7 +28,6 @@ source = {
             ]
 }
 
-base_nvcc_flags = ['-O2', '-arch=sm_120a', '--maxrregcount=128']
 
 if kernels_to_compile_str == 'all':
     kernels_to_compile = list(source.keys())
