@@ -5,12 +5,13 @@ import matplotlib.pyplot as plt
 
 import vq_gemm_cuda_s1
 import vq_gemm_cuda_s2_128
-import vq_gemm_cuda_s2_1024
-import vq_gemm_cuda_s3
+import vq_gemm_cuda_s2_512
+import vq_gemm_cuda_s3_naive
+import vq_gemm_cuda_s3_wasp
 
-M = 2048
+M = 4096
 K = 4096
-N = 640
+N = 2048
 profiling = (os.getenv('PROFILING', 'FALSE') == 'TRUE')
 run_vq_gemm = not (os.getenv('TEST_GEMM', 'FALSE') == 'TRUE')
 if not run_vq_gemm:
@@ -19,8 +20,9 @@ kernel_to_use_str = os.getenv('KERNELS', 'all')
 module_dict = {
     "s1": vq_gemm_cuda_s1,
     "s2_128": vq_gemm_cuda_s2_128,
-    "s2_1024": vq_gemm_cuda_s2_1024,
-    "s3": vq_gemm_cuda_s3
+    "s2_512": vq_gemm_cuda_s2_512,
+    "s3_naive": vq_gemm_cuda_s3_naive,
+    "s3_wasp": vq_gemm_cuda_s3_wasp
 }
 module = module_dict[kernel_to_use_str]
 ENTRY = 256
