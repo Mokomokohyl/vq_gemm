@@ -4,6 +4,10 @@
 conda env with torch and matplotlib
 
 ### Run tests
+
+Before getting started, run `make setup` to compile reference GeMM (cublas pure fp16).  
+Then run `make compile` to compile all kernels.
+
 `<version>` can be `s1`, `s2-128`, `s2-512`, `s3-naive`, `s3-wasp`
 - `make compile KERNELS=<version>`: compile `<version>` kernel, generate vq_gemm_cuda_\<version\>.so   
 `make compile` compile all kernels.
