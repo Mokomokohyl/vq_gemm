@@ -9,8 +9,13 @@ CONDA_ACTIVATE = /home/ylhuang/miniconda3/bin/activate
 
 CONDA_ENV_NAME = fiber
 
-compile:
+setup:
 	mkdir -p logs
+	mkdir -p figures
+	mkdir -p ncu_reports
+	KERNELS=cublas_gemm python compile_kernels.py build_ext --inplace
+
+compile:
 	KERNELS=$(KERNELS) python compile_kernels.py build_ext --inplace
 run:
 	KERNELS=$(KERNELS) python bench.py > ./logs/bench_$(KERNELS).log 2>&1
@@ -19,7 +24,6 @@ try:;$(MAKE) compile;$(MAKE) run
 prof-cmd:
 	PROFILING=TRUE python bench.py	
 profile: # revise to activate your conda env
-	mkdir -p ncu_reports
 	rm -f ./ncu_reports/$(NCU_LOG_NAME).ncu-rep
 	$(NCU) --import-source yes --set full -o ./ncu_reports/$(NCU_LOG_NAME) $(MAKE) prof-cmd > ./logs/ncu_$(KERNELS)_ouptput.log
 

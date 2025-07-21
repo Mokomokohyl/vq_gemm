@@ -8,6 +8,7 @@ base_nvcc_flags = ['-O2', '-arch=sm_120a', '-lineinfo']
 
 kernels_to_compile_str = os.getenv('KERNELS', 'all')
 nvcc_flags = {
+    'cublas_gemm': base_nvcc_flags + ['-arch=sm_120a'],
     's1': base_nvcc_flags,
     's2_128': base_nvcc_flags,
     's2_512': base_nvcc_flags,
@@ -15,6 +16,10 @@ nvcc_flags = {
     's3_wasp': base_nvcc_flags + ['--maxrregcount=128'],
 }
 source = {
+    'cublas_gemm': [
+        'bind.cpp',
+        './ref_gemm/cublas_gemm_fp16.cu',
+    ],
     's1':   [
                 'bind.cpp',
                 './strategy_1/src.cu',

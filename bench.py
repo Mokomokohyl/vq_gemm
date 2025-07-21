@@ -3,6 +3,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 
+import vq_gemm_cuda_cublas_gemm
 import vq_gemm_cuda_s1
 import vq_gemm_cuda_s2_128
 import vq_gemm_cuda_s2_512
@@ -52,11 +53,11 @@ def vq_gemm_reference(input, w, codebook):
     w_decoded = codebook[row_idx_expand, entry_idx]  # [K, N, RATIO]
     # reshape为 [K, N * RATIO]
     w_decoded = w_decoded.reshape(K, N * RATIO)
-    output = torch.matmul(input, w_decoded)
+    output = vq_gemm_cuda_cublas_gemm.gemm(input, w_decoded)
     return output
 
 def gemm_ref(input, w):
-    return torch.matmul(input, w)
+    return vq_gemm_cuda_cublas_gemm.gemm(input, w)
 
 def main():
     if profiling:
