@@ -1,6 +1,7 @@
 #include "cuda.h"
 #include "cuda_runtime.h"
 #include "cuda_fp16.h"
+#include <cublas_v2.h>
 #include <torch/extension.h>
 #include "stdio.h"
 #include <iostream>
@@ -232,26 +233,41 @@ torch::Tensor gemm(
     half* w_ptr = reinterpret_cast<half*>(w.data_ptr<at::Half>());
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
 
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    const __half alpha = __float2half(1.0f);
+    const __half beta = __float2half(0.0f);
+
     dim3 grid(M / BLOCK_TILE_M, N / BLOCK_TILE_N);
     dim3 block(BLOCK_SIZE);
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
-        gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
-            input_ptr, 
-            w_ptr,
-            o_ptr,
-            M, N, K
-        );
+        cublasGemmEx(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            w_ptr, CUDA_R_16F, N,
+            input_ptr, CUDA_R_16F, K,
+            &beta,
+            o_ptr, CUDA_R_16F, N,
+            CUBLAS_COMPUTE_16F,
+            CUBLAS_GEMM_DEFAULT);
     }
     cudaEventRecord(st);
     for (int i = 0; i < iter; i++) {
 #endif
-        gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
-            input_ptr, 
-            w_ptr,
-            o_ptr,
-            M, N, K
-        );
+        cublasGemmEx(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            w_ptr, CUDA_R_16F, N,
+            input_ptr, CUDA_R_16F, K,
+            &beta,
+            o_ptr, CUDA_R_16F, N,
+            CUBLAS_COMPUTE_16F,
+            CUBLAS_GEMM_DEFAULT);
 #if PROFILING == 1
     }
     cudaEventRecord(ed);

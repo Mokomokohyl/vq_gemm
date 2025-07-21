@@ -8,7 +8,7 @@ base_nvcc_flags = ['-O2', '-arch=sm_120a', '-lineinfo']
 
 kernels_to_compile_str = os.getenv('KERNELS', 'all')
 nvcc_flags = {
-    's1': base_nvcc_flags,
+    's1': base_nvcc_flags + ['-lcublas'],
     's2_128': base_nvcc_flags,
     's2_512': base_nvcc_flags,
     's3_naive': base_nvcc_flags + ['--maxrregcount=128'],
