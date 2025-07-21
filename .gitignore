@@ -1,4 +1,5 @@
 build
+ncu_reports
 *.log
 *.so
 *.png
