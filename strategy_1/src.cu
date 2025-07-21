@@ -367,6 +367,11 @@ torch::Tensor e2e_gemm(
     torch::Tensor B = torch::full({K, N * RATIO}, 0, options);
     half* B_ptr = reinterpret_cast<half*>(B.data_ptr<at::Half>());
 
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    const __half alpha = __float2half(1.0f);
+    const __half beta = __float2half(0.0f);
+
     dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
     dim3 block(BLOCK_SIZE); // = 128
     // For dequant kernel
@@ -380,12 +385,17 @@ torch::Tensor e2e_gemm(
             B_ptr,
             N, K
         );
-        gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
-            input_ptr, 
-            B_ptr,
-            o_ptr,
-            M, N * RATIO, K
-        );
+        cublasGemmEx(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            N * RATIO, M, K,
+            &alpha,
+            B_ptr, CUDA_R_16F, N * RATIO,
+            input_ptr, CUDA_R_16F, K,
+            &beta,
+            o_ptr, CUDA_R_16F, N * RATIO,
+            CUBLAS_COMPUTE_16F,
+            CUBLAS_GEMM_DEFAULT);
     }
     cudaEventRecord(st);
     for (int i = 0; i < iter; i++) {
@@ -396,12 +406,17 @@ torch::Tensor e2e_gemm(
             B_ptr,
             N, K
         );
-        gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
-            input_ptr, 
-            B_ptr,
-            o_ptr,
-            M, N * RATIO, K
-        );
+        cublasGemmEx(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            N * RATIO, M, K,
+            &alpha,
+            B_ptr, CUDA_R_16F, N * RATIO,
+            input_ptr, CUDA_R_16F, K,
+            &beta,
+            o_ptr, CUDA_R_16F, N * RATIO,
+            CUBLAS_COMPUTE_16F,
+            CUBLAS_GEMM_DEFAULT);
 #if PROFILING == 1
     }
     cudaEventRecord(ed);
