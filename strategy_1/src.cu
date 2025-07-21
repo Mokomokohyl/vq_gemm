@@ -39,12 +39,12 @@
 // for dequant kernel
 #define DQ_BLOCK_SIZE 1024
 #define DQ_BLOCK_TILE_N 128
-#define DQ_BLOCK_TILE_M 32
+#define DQ_BLOCK_TILE_K 32
 
 // A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
 #define MAX_SHARED_MEMORY_USAGE (16384 + CODEBOOK_BUFFERING * (32768 / HOT))
 // uint8(1) -> half(2) + codebook
-#define DEQUANT_SHARED_MEMORY_USAGE (DQ_BLOCK_TILE_N * DQ_BLOCK_TILE_M * RATIO * 2 + DQ_BLOCK_TILE_N / 4 * ENTRY * RATIO * 2)
+#define DEQUANT_SHARED_MEMORY_USAGE (DQ_BLOCK_TILE_N * DQ_BLOCK_TILE_K * RATIO * 2 + DQ_BLOCK_TILE_N / 4 * ENTRY * RATIO * 2)
 #define GEMM_SHARED_MEMORY_USAGE (BLOCK_TILE_M * BLOCK_TILE_K * 2 + BLOCK_TILE_K * RATIO * BLOCK_TILE_N * 2)
 __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     uint32_t addr;
@@ -276,7 +276,7 @@ __global__ void dequant_kernel(
     uint8_t indice[4];
     half* B_buf = reinterpret_cast<half*>(shmem);
     // codebook size: [DQ_BLOCK_TILE_N / 4 (=32) ,ENTRY * RATIO] (RATIO = 2)
-    half* codebook_buf = reinterpret_cast<half*>(shmem + DQ_BLOCK_TILE_M * DQ_BLOCK_TILE_N * RATIO * 2);
+    half* codebook_buf = reinterpret_cast<half*>(shmem + DQ_BLOCK_TILE_K * DQ_BLOCK_TILE_N * RATIO * 2);
     uint32_t Brow = threadIdx.x % 32; // [0, 31]
     uint32_t Bcol = (threadIdx.x / 32) * 4; // 4 * [0, 31]
     // Load Codebook to shmem
@@ -308,7 +308,7 @@ __global__ void dequant_kernel(
     half* codebook_line = codebook_buf + (Bcol / 4) * ENTRY * RATIO;
 
     // Load Bq indice to reg.
-    *(uint32_t*)(&indice[0]) = *(uint32_t*)(&Bq[(Brow + blockIdx.x * DQ_BLOCK_TILE_M) * N + blockIdx.y * DQ_BLOCK_TILE_N + Bcol]);
+    *(uint32_t*)(&indice[0]) = *(uint32_t*)(&Bq[(Brow + blockIdx.x * DQ_BLOCK_TILE_K) * N + blockIdx.y * DQ_BLOCK_TILE_N + Bcol]);
 
     // dequant and write to HBM
     *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 0) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[0]) * RATIO]);
@@ -317,7 +317,7 @@ __global__ void dequant_kernel(
     *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 3) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[3]) * RATIO]);
 
     // write back to HBM
-    *(int4*)(&B[(Brow + blockIdx.x * DQ_BLOCK_TILE_M) * N * RATIO + (blockIdx.y * DQ_BLOCK_TILE_N + Bcol) * RATIO]) = *(int4*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol) * RATIO]);
+    *(int4*)(&B[(Brow + blockIdx.x * DQ_BLOCK_TILE_K) * N * RATIO + (blockIdx.y * DQ_BLOCK_TILE_N + Bcol) * RATIO]) = *(int4*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol) * RATIO]);
 }
 
 torch::Tensor e2e_gemm(
@@ -354,7 +354,7 @@ torch::Tensor e2e_gemm(
     dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
     dim3 block(BLOCK_SIZE); // = 128
     // For dequant kernel
-    dim3 dq_grid(M / DQ_BLOCK_TILE_M, N / DQ_BLOCK_TILE_N); // 4096 / 128 blocks. split on N
+    dim3 dq_grid(K / DQ_BLOCK_TILE_K, N / DQ_BLOCK_TILE_N); // 4096 / 128 blocks. split on N
     dim3 dq_block(DQ_BLOCK_SIZE); // = 1024
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
