@@ -11,6 +11,7 @@ import vq_gemm_cuda_s3
 M = 2048
 K = 4096
 N = 640
+profiling = (os.getenv('PROFILING', 'FALSE') == 'TRUE')
 run_vq_gemm = not (os.getenv('TEST_GEMM', 'FALSE') == 'TRUE')
 if not run_vq_gemm:
     M = N = K = 4096
@@ -56,6 +57,17 @@ def gemm_ref(input, w):
     return torch.matmul(input, w)
 
 def main():
+    if profiling:
+        print(f"  M={M}, K={K}, N={N}, ENTRY={ENTRY}, RATIO={RATIO}")
+        print(f"  Device: {device}")
+        print("=" * 60)
+        input = torch.randn(M, K, dtype=torch.float16, device=device)
+        w = torch.randint(0, ENTRY, (K, N), dtype=torch.uint8, device=device)
+        codebook = torch.randn(N // 4, ENTRY, RATIO, dtype=torch.float16, device=device)
+        torch.cuda.synchronize()
+        output_cuda = module.e2e_gemm(input, w, codebook)
+        return
+
     print(f"VQ GEMM Benchmark")
     print(f"  M={M}, K={K}, N={N}, ENTRY={ENTRY}, RATIO={RATIO}")
     print(f"  Device: {device}")

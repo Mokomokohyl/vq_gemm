@@ -10,7 +10,7 @@
 #include "mma.h"
 #include <random>
 
-#define PROFILING 1
+#define PROFILING 0
 #define WARP_NUM 4
 #define WARP_SIZE 32
 #define BLOCK_SIZE 512 // For s3 use 1024.
