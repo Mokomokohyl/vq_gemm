@@ -8,9 +8,9 @@ import vq_gemm_cuda_s2_128
 import vq_gemm_cuda_s2_1024
 import vq_gemm_cuda_s3
 
-M = 4096
+M = 2048
 K = 4096
-N = 2048
+N = 640
 run_vq_gemm = not (os.getenv('TEST_GEMM', 'FALSE') == 'TRUE')
 if not run_vq_gemm:
     M = N = K = 4096
