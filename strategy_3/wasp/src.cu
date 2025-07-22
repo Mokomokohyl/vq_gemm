@@ -261,7 +261,7 @@ __device__ void load_codebook(
 }
 
 __device__ __forceinline__ void consumer(
-    barrier ready[], barrier filled[],
+    barrier ready[], barrier filled[], barrier::arrival_token* token,
     uint32_t* A_frags, uint32_t* B_frags, uint32_t* C_frags,
     half* A[], half* B[],
     half* _o,
@@ -269,12 +269,13 @@ __device__ __forceinline__ void consumer(
 )
 {
     // notify producer that buffers are ready for initial fill
-    barrier::arrival_token token1 = ready[0].arrive();
-    barrier::arrival_token token2 = ready[1].arrive();
+    token[0] = ready[0].arrive();
+    token[1] = ready[1].arrive();
 
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
         // wait for buffer[ko % 2]
-        filled[ko % 2].arrive_and_wait();
+        token[2 + ko % 2] = filled[ko % 2].arrive();
+        filled[ko % 2].wait(std::move(token[2 + ko % 2]));
 
         // consume buffer[ko % 2]
         for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
@@ -289,13 +290,13 @@ __device__ __forceinline__ void consumer(
         }
 
         // buffer[ko % 2] consumed
-        barrier::arrival_token token = ready[ko % 2].arrive();
+        token[ko % 2] = ready[ko % 2].arrive();
     }
     storeC(_o, C_frags, M, N * RATIO);    
 }
 
 __device__ __forceinline__ void producer(
-    barrier ready[], barrier filled[],
+    barrier ready[], barrier filled[], barrier::arrival_token *token,
     half* _input, uint8_t* _w,
     half* codebook_buf,
     half* A[], half* B[],
@@ -304,7 +305,8 @@ __device__ __forceinline__ void producer(
 {
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
         // wait for buffer[ko % 2] consumed
-        ready[ko % 2].arrive_and_wait();
+        token[ko % 2] = ready[ko % 2].arrive();
+        ready[ko % 2].wait(std::move(token[ko % 2]));
 
         // load A[ko % 2]
         loadShmemA(A[ko % 2], _input, M, K, ko);
@@ -313,7 +315,7 @@ __device__ __forceinline__ void producer(
         dequantToShmemB(B[ko % 2], _w, codebook_buf, K, N, ko);
 
         // buffer[ko % 2] filled
-        barrier::arrival_token token = filled[ko % 2].arrive();
+        token[2 + ko % 2] = filled[ko % 2].arrive();
     }
 }
 
@@ -341,10 +343,13 @@ __global__ void e2e_gemm_kernel(
     B[0] = reinterpret_cast<half*>(shmem + 2 * BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
     B[1] = reinterpret_cast<half*>(shmem + (2 * BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
     half* codebook_buf = reinterpret_cast<half*>(shmem + 2 * (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
+
+    // ready[0], ready[1], filled[0], filled[1]
     barrier* bar = reinterpret_cast<barrier*>(shmem + (2 * (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K + 16 * ENTRY * RATIO) * sizeof(half));
+    barrier::arrival_token* token = reinterpret_cast<barrier::arrival_token*>(bar + 4);
 
     if (warp_group_id == 0) {
-        // Consumer init the barrier
+        // 4 threads in consumer init the barrier
         if (warp_id == 0 && lane_id < 4) {
             init(bar + lane_id, block.size());
         }
@@ -363,7 +368,7 @@ __global__ void e2e_gemm_kernel(
         uint32_t C_frags[64] = {0};
         // Consumer do mma
         consumer(
-            bar, bar + 2,
+            bar, bar + 2, token,
             A_frags, B_frags, C_frags,
             A, B,
             _o,
@@ -373,7 +378,7 @@ __global__ void e2e_gemm_kernel(
         // Producer warp group loadShmemA & dequantToShmemB
         warpgroup_reg_dealloc<24>();
         producer(
-            bar, bar + 2,
+            bar, bar + 2, token,
             _input, _w,
             codebook_buf,
             A, B,
