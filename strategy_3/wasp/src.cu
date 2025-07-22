@@ -42,7 +42,7 @@
 #define MAX_SHARED_MEMORY_USAGE \
 (2 * (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half) \
 + (BLOCK_TILE_N / (4 * RATIO)) * ENTRY * RATIO * sizeof(half)) \
-+ 32
++ 128
 
 #define PRODUCER_WARP 16
 #define CONSUMER_WARP 4
@@ -337,15 +337,15 @@ __global__ void e2e_gemm_kernel(
     half* A[2];
     half* B[2];
     A[0] = reinterpret_cast<half*>(shmem);
-    B[0] = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
-    A[1] = reinterpret_cast<half*>(shmem + (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
+    A[1] = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
+    B[0] = reinterpret_cast<half*>(shmem + 2 * BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
     B[1] = reinterpret_cast<half*>(shmem + (2 * BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
     half* codebook_buf = reinterpret_cast<half*>(shmem + 2 * (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
-    __shared__ barrier bar[4]; // ready[0], ready[1], filled[0], filled[1]
+    barrier* bar = reinterpret_cast<barrier*>(shmem + (2 * (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K + 16 * ENTRY * RATIO) * sizeof(half));
 
-    if (lane_id < 4 && warp_group_id == 0) {
+    if (warp_group_id == 0) {
         // Consumer init the barrier
-        if (warp_id == 0) {
+        if (warp_id == 0 && lane_id < 4) {
             init(bar + lane_id, block.size());
         }
     } else {
