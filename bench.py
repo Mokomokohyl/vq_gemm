@@ -12,7 +12,7 @@ import vq_gemm_cuda_s3_wasp
 
 M = 2048
 K = 4096
-N = 768
+N = 640
 profiling = (os.getenv('PROFILING', 'FALSE') == 'TRUE')
 run_vq_gemm = not (os.getenv('TEST_GEMM', 'FALSE') == 'TRUE')
 if not run_vq_gemm:

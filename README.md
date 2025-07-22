@@ -24,4 +24,3 @@ Error heat map are generated in ./figures/
 ## TODO
 - [ ] optimize `s2-128`. Currently for M, N, K = (4096, 2048, 4096), `s1` has 195.45TFLOPS while `s2` has only 156.292TFLOPS
 - [ ] `s2-512`
-- [ ] `s3-wasp`
