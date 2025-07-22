@@ -11,7 +11,7 @@
 #include <cudaTypedefs.h>
 #include <random>
 
-#define PROFILING 0
+#define PROFILING 1
 #define WARP_NUM 4
 #define WARP_SIZE 32
 #define BLOCK_SIZE 640 // For s3 use 640.
@@ -90,16 +90,15 @@ __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
 }
 
 __device__ void loadShmemA(half* shmem, half *A, int m, int k, int ko) {
+    // 512 threads load 128 x 32 into shmem, 128 threads for 32 x 32, each load 8 halves (16 bytes)
     int tid = threadIdx.x - CONSUMER_WARP * WARP_SIZE;
-    for (int i = 0; i < ((BLOCK_TILE_M * BLOCK_TILE_K) / MMA_BLOCK_SIZE) / 8; i++) {
-        int row = i * 32 + tid / 4;
-        int col = 8 * (tid % 4);
-        asm volatile(
-            "cp.async.ca.shared.global [%0], [%1], 16;\n"
-            ::
-            "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_K / WMMA_TILE_K) * WMMA_TILE_M * (WMMA_TILE_K)) + (col / WMMA_TILE_K) * (WMMA_TILE_M * (WMMA_TILE_K)) + (row % WMMA_TILE_M) * (WMMA_TILE_K) + col % WMMA_TILE_K)), "l"(&A[(blockIdx.x * BLOCK_TILE_M + row) * k + ko * BLOCK_TILE_K + col])
-        );
-    }
+    int row = tid / 4;
+    int col = 8 * (tid % 4);
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        ::
+        "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_K / WMMA_TILE_K) * WMMA_TILE_M * (WMMA_TILE_K)) + (col / WMMA_TILE_K) * (WMMA_TILE_M * (WMMA_TILE_K)) + (row % WMMA_TILE_M) * (WMMA_TILE_K) + col % WMMA_TILE_K)), "l"(&A[(blockIdx.x * BLOCK_TILE_M + row) * k + ko * BLOCK_TILE_K + col])
+    );
 }
 
 __device__ void loadShmemB(half* shmem, half *B, int k, int n, int ko) {
@@ -217,7 +216,7 @@ __device__ void storeC(half* C, uint32_t* frag, int m, int n) {
 }
 
 __device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook_shmem, int k, int n, int ko) {
-    // 32x64 uint8, 512 threads, every thread dequant 4 uint8 indices
+    // 32x64 uint8, 512 threads, every thread dequant 2 x 2 uint8 indices
     int tid = threadIdx.x - CONSUMER_WARP * WARP_SIZE;
     uint32_t row = tid / 16; //  
     uint32_t col = tid % 16 * 4; // 4 * [0, 15]
