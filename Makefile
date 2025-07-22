@@ -16,7 +16,7 @@ setup:
 	KERNELS=cublas_gemm python compile_kernels.py build_ext --inplace
 
 compile:
-	KERNELS=$(KERNELS) python compile_kernels.py build_ext --inplace
+	KERNELS=$(KERNELS) python compile_kernels.py build_ext --inplace > compile_error.log 2>&1
 run:
 	KERNELS=$(KERNELS) python bench.py > ./logs/bench_$(KERNELS).log 2>&1
 try:;$(MAKE) compile;$(MAKE) run

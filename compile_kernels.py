@@ -13,7 +13,7 @@ nvcc_flags = {
     's2_128': base_nvcc_flags,
     's2_512': base_nvcc_flags,
     's3_naive': base_nvcc_flags + ['--maxrregcount=128'],
-    's3_wasp': base_nvcc_flags + ['--maxrregcount=128'],
+    's3_wasp': base_nvcc_flags + ['--maxrregcount=64', '-lcuda'],
 }
 source = {
     'cublas_gemm': [

@@ -73,9 +73,9 @@ def main():
         return
 
     print(f"VQ GEMM Benchmark")
-    print(f"Used kernel VERSION={kernel_to_use_str}")
-    print(f"  M={M}, K={K}, N={N}, ENTRY={ENTRY}, RATIO={RATIO}")
-    print(f"  Device: {device}")
+    print(f"Using kernel VERSION={kernel_to_use_str}")
+    print(f"M={M}, K={K}, N={N}, ENTRY={ENTRY}, RATIO={RATIO}")
+    print(f"Device: {device}")
     print("=" * 60)
 
     # 运行 VQ GEMM

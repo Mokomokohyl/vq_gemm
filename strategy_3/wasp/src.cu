@@ -8,12 +8,13 @@
 #include <cuda/barrier>
 #include <cooperative_groups.h>
 #include "mma.h"
+#include <cudaTypedefs.h>
 #include <random>
 
 #define PROFILING 0
 #define WARP_NUM 4
 #define WARP_SIZE 32
-#define BLOCK_SIZE 512 // For s3 use 1024.
+#define BLOCK_SIZE 640 // For s3 use 640.
 #define MMA_BLOCK_SIZE 128
 #define ENTRY 256
 #define RATIO 2
@@ -38,6 +39,18 @@
 
 #define CODEBOOK_BUFFERING 1
 
+#define MAX_SHARED_MEMORY_USAGE \
+(2 * (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half) \
++ (BLOCK_TILE_N / (4 * RATIO)) * ENTRY * RATIO * sizeof(half)) \
++ 32
+
+#define PRODUCER_WARP 16
+#define CONSUMER_WARP 4
+
+using barrier = cuda::barrier<cuda::thread_scope_block>;
+namespace ptx = cuda::ptx;
+namespace cde = cuda::device::experimental;
+namespace cg = cooperative_groups;
 
 #define CHECK_LAST_CUDA_ERROR() checkLast(__FILE__, __LINE__)
 void checkLast(const char* const file, const int line)
@@ -53,8 +66,6 @@ void checkLast(const char* const file, const int line)
     }
 }
 
-using barrier = cuda::barrier<cuda::thread_scope_block>;
-namespace ptx = cuda::ptx;
 
 template<uint32_t RegCount>
 __device__ __forceinline__ void warpgroup_reg_alloc(){
@@ -66,8 +77,6 @@ __device__ __forceinline__ void warpgroup_reg_dealloc(){
   asm volatile( "setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount) );
 }
 
-// A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
-#define MAX_SHARED_MEMORY_USAGE (16384 + CODEBOOK_BUFFERING * (32768 / HOT))
 __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     uint32_t addr;
     asm volatile(
@@ -81,9 +90,10 @@ __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
 }
 
 __device__ void loadShmemA(half* shmem, half *A, int m, int k, int ko) {
+    int tid = threadIdx.x - CONSUMER_WARP * WARP_SIZE;
     for (int i = 0; i < ((BLOCK_TILE_M * BLOCK_TILE_K) / MMA_BLOCK_SIZE) / 8; i++) {
-        int row = i * 32 + threadIdx.x / 4;
-        int col = 8 * (threadIdx.x % 4);
+        int row = i * 32 + tid / 4;
+        int col = 8 * (tid % 4);
         asm volatile(
             "cp.async.ca.shared.global [%0], [%1], 16;\n"
             ::
@@ -208,8 +218,9 @@ __device__ void storeC(half* C, uint32_t* frag, int m, int n) {
 
 __device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook_shmem, int k, int n, int ko) {
     // 32x64 uint8, 512 threads, every thread dequant 4 uint8 indices
-    uint32_t row = threadIdx.x / 16; //  
-    uint32_t col = threadIdx.x % 16 * 4; // 4 * [0, 15]
+    int tid = threadIdx.x - CONSUMER_WARP * WARP_SIZE;
+    uint32_t row = tid / 16; //  
+    uint32_t col = tid % 16 * 4; // 4 * [0, 15]
     uint32_t local_idx = col / 4;
 
     uint8_t indices[4];
@@ -225,26 +236,85 @@ __device__ void load_codebook(
     half* codebook
 )
 {
+    int tid = threadIdx.x - CONSUMER_WARP * WARP_SIZE;
+
     uint32_t codebook_begin_row = blockIdx.y * 16;
     // Assuming HOT is less than 16
     // uint32_t iters_to_load = ((16 * ENTRY * RATIO / HOT) / 8) / BLOCK_SIZE; // = 2
     uint32_t load_cols = (ENTRY * RATIO) / 8; // = 64
-    uint32_t load_rows = BLOCK_SIZE / load_cols; // = 8
+    uint32_t load_rows = (PRODUCER_WARP * WARP_SIZE) / load_cols; // = 8
 
     asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n" 
     :
-    :   "r"(shmem_uint32_t(&shmem[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])), 
-        "l"(&codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
+    :   "r"(shmem_uint32_t(&shmem[(tid / load_cols) * (ENTRY * RATIO) + (tid % load_cols) * 8])), 
+        "l"(&codebook[(codebook_begin_row + tid / load_cols) * (ENTRY * RATIO) + (tid % load_cols) * 8])
     );
     asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n" 
     :
-    :   "r"(shmem_uint32_t(&shmem[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])),
-        "l"(&codebook[(load_rows + codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
+    :   "r"(shmem_uint32_t(&shmem[(load_rows + tid / load_cols) * (ENTRY * RATIO) + (tid % load_cols) * 8])),
+        "l"(&codebook[(load_rows + codebook_begin_row + tid / load_cols) * (ENTRY * RATIO) + (tid % load_cols) * 8])
     );
     // *(int4*)(&shmem[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
     // *(int4*)(&codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
     // *(int4*)(&shmem[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
     // *(int4*)(&codebook[(load_rows + codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
+}
+
+__device__ __forceinline__ void consumer(
+    barrier ready[], barrier filled[],
+    uint32_t* A_frags, uint32_t* B_frags, uint32_t* C_frags,
+    half* A[], half* B[],
+    half* _o,
+    int M, int N, int K
+)
+{
+    // notify producer that buffers are ready for initial fill
+    barrier::arrival_token token1 = ready[0].arrive();
+    barrier::arrival_token token2 = ready[1].arrive();
+
+    for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
+        // wait for buffer[ko % 2]
+        filled[ko % 2].arrive_and_wait();
+
+        // consume buffer[ko % 2]
+        for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
+            loadFragA_mma(A_frags, A[ko % 2], ki);
+            loadFragB_mma(B_frags, B[ko % 2], ki);
+            // dequantToRegB(B_frags, _w, _codebook, codebook_buf, K, N, ko, ki);
+            for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
+                for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
+                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+                }
+            }
+        }
+
+        // buffer[ko % 2] consumed
+        barrier::arrival_token token = ready[ko % 2].arrive();
+    }
+    storeC(_o, C_frags, M, N * RATIO);    
+}
+
+__device__ __forceinline__ void producer(
+    barrier ready[], barrier filled[],
+    half* _input, uint8_t* _w,
+    half* codebook_buf,
+    half* A[], half* B[],
+    int M, int N, int K
+)
+{
+    for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
+        // wait for buffer[ko % 2] consumed
+        ready[ko % 2].arrive_and_wait();
+
+        // load A[ko % 2]
+        loadShmemA(A[ko % 2], _input, M, K, ko);
+        asm volatile("cp.async.wait_all;\n"::);
+        // dequant to B[ko % 2]
+        dequantToShmemB(B[ko % 2], _w, codebook_buf, K, N, ko);
+
+        // buffer[ko % 2] filled
+        barrier::arrival_token token = filled[ko % 2].arrive();
+    }
 }
 
 __global__ void e2e_gemm_kernel(
@@ -253,66 +323,62 @@ __global__ void e2e_gemm_kernel(
     half* _codebook,
     half* _o,
     int M, int N, int K
+    // const __grid_constant__ CUtensorMap tensor_map_A
 )
 {
     auto block = cooperative_groups::this_thread_block();
-    __shared__ barrier bar[1];
-    __shared__ barrier::arrival_token token;
-    if (block.thread_rank() == 0) {
-        init(bar, block.size());
-        ptx::fence_proxy_async(ptx::space_shared);
-    }
-    block.sync();
+    // warp_group_id   = 0 for Consumer (128 threads)
+    //               1 ~ 4 for Producer (512 threads)
+    uint32_t warp_group_id = threadIdx.x / (WARP_SIZE * 4);
+    uint32_t warp_id = threadIdx.x / WARP_SIZE;
+    uint32_t lane_id = threadIdx.x % WARP_SIZE;
 
     extern __shared__ uint8_t shmem[];
-    half *A1 = reinterpret_cast<half*>(shmem);
-    half *B1 = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
-    half *codebook_buf = reinterpret_cast<half*>(shmem + (BLOCK_TILE_M * BLOCK_TILE_K + BLOCK_TILE_K * BLOCK_TILE_N) * sizeof(half));
+    half* A[2];
+    half* B[2];
+    A[0] = reinterpret_cast<half*>(shmem);
+    B[0] = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
+    A[1] = reinterpret_cast<half*>(shmem + (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
+    B[1] = reinterpret_cast<half*>(shmem + (2 * BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
+    half* codebook_buf = reinterpret_cast<half*>(shmem + 2 * (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
+    __shared__ barrier bar[4]; // ready[0], ready[1], filled[0], filled[1]
 
-    uint32_t A_frags[16];
-    uint32_t B_frags[16];
-    uint32_t C_frags[64] = {0};
-
-    // Load codebook
-    load_codebook(codebook_buf, _codebook);
-    asm volatile("cp.async.wait_all;\n"::);
-    __syncthreads();
-
-    uint32_t warp_group_id = threadIdx.x / (WARP_SIZE * 4); // use warp_group_id to determine reg num.
-
-    for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
-        if (warp_group_id == 0) {
-            warpgroup_reg_dealloc<128>();
-        } else {
-            warpgroup_reg_alloc<128>();
+    if (lane_id < 4 && warp_group_id == 0) {
+        // Consumer init the barrier
+        if (warp_id == 0) {
+            init(bar + lane_id, block.size());
         }
-
-        dequantToShmemB(B1, _w, codebook_buf, K, N, ko);
-
-        if (warp_group_id == 0) { // the four warps doing mma
-            warpgroup_reg_alloc<224>();
-
-            loadShmemA(A1, _input, M, K, ko);
-            asm volatile("cp.async.wait_all;\n"::);
-            bar[0].arrive_and_wait();
-            for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
-                loadFragA_mma(A_frags, A1, ki);
-                loadFragB_mma(B_frags, B1, ki);
-                // dequantToRegB(B_frags, _w, _codebook, codebook_buf, K, N, ko, ki);
-                for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
-                    for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
-                        compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
-                    }
-                }
-            }
-        } else { // other warp groups: do nothing
-            warpgroup_reg_dealloc<24>();
-            token = bar[0].arrive();
-        }
-        __syncthreads();
+    } else {
+        // Producer load codebook (cp.async)
+        load_codebook(codebook_buf, _codebook);
     }
+    asm volatile("cp.async.wait_all;\n"::);
+    block.sync();
+
     if (warp_group_id == 0) {
-        storeC(_o, C_frags, M, N * RATIO);    
+        // Consumer warp group
+        warpgroup_reg_alloc<224>();
+        uint32_t A_frags[16];
+        uint32_t B_frags[16];
+        uint32_t C_frags[64] = {0};
+        // Consumer do mma
+        consumer(
+            bar, bar + 2,
+            A_frags, B_frags, C_frags,
+            A, B,
+            _o,
+            M, N, K
+        );
+    } else {
+        // Producer warp group loadShmemA & dequantToShmemB
+        warpgroup_reg_dealloc<24>();
+        producer(
+            bar, bar + 2,
+            _input, _w,
+            codebook_buf,
+            A, B,
+            M, N, K
+        );
     }
 }
 
@@ -345,6 +411,31 @@ torch::Tensor e2e_gemm(
     half* codebook_ptr = reinterpret_cast<half*>(codebook.data_ptr<at::Half>());
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
 
+    // Initialize CUtensorMap for TMA
+    // CUtensorMap tensor_map_A{};
+    // constexpr uint32_t rank = 2; // dimension
+    // uint64_t size[rank] = {K, M}; // width, height of A in HBM
+    // uint64_t stride[rank - 1] = {M * sizeof(half)}; // row stride in bytes (16x)
+    // // Shmem layout. fit in ldmatrix
+    // uint32_t box_size[rank] = {16, BLOCK_TILE_M * BLOCK_TILE_K / 16};
+    // uint32_t elem_stride[rank] = {1, 1};
+// 
+    // // Create the tensor descriptor. '-lcuda'
+    // CUresult res = cuTensorMapEncodeTiled(
+        // &tensor_map_A,                
+		// CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+        // rank,                       
+        // input_ptr,                 
+        // size,                       
+        // stride,                     
+        // box_size,                   
+        // elem_stride,                
+        // CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        // CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        // CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        // CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    // );
+
     dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
     dim3 block(BLOCK_SIZE);
 #if PROFILING == 1
@@ -355,6 +446,7 @@ torch::Tensor e2e_gemm(
             codebook_ptr, 
             o_ptr,
             M, N, K
+            // tensor_map_A
         );
     }
     cudaEventRecord(st);
@@ -366,10 +458,11 @@ torch::Tensor e2e_gemm(
             codebook_ptr, 
             o_ptr,
             M, N, K
+            // tensor_map_A
         );
-    CHECK_LAST_CUDA_ERROR();
 #if PROFILING == 1
     }
+    CHECK_LAST_CUDA_ERROR();
     cudaEventRecord(ed);
     cudaEventSynchronize(ed);
     float ms;
@@ -417,6 +510,7 @@ __global__ void gemm_kernel(
     storeShmemC(_o, C_buf, M, N);   
 }
 
+// Not correct after adding Producer & Consumer pattern
 torch::Tensor gemm(
     torch::Tensor input,
     torch::Tensor w
@@ -444,11 +538,13 @@ torch::Tensor gemm(
     half* w_ptr = reinterpret_cast<half*>(w.data_ptr<at::Half>());
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
 
+    int dynamic_smem_size = MAX_SHARED_MEMORY_USAGE - 32;
+
     dim3 grid(M / BLOCK_TILE_M, N / BLOCK_TILE_N);
     dim3 block(BLOCK_SIZE);
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
-        gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
+        gemm_kernel<<<grid, block, dynamic_smem_size>>>(
             input_ptr, 
             w_ptr,
             o_ptr,
@@ -458,7 +554,7 @@ torch::Tensor gemm(
     cudaEventRecord(st);
     for (int i = 0; i < iter; i++) {
 #endif
-        gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
+        gemm_kernel<<<grid, block, dynamic_smem_size>>>(
             input_ptr, 
             w_ptr,
             o_ptr,
