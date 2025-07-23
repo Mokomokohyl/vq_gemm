@@ -10,7 +10,7 @@
 #include <random>
 
 #define PROFILING 1
-#define WARP_NUM 4
+#define WARP_NUM 16 // 16 * 32 = 512
 #define WARP_SIZE 32
 #define BLOCK_SIZE (WARP_NUM * WARP_SIZE)
 #define ENTRY 256
@@ -22,8 +22,8 @@
 #define BLOCK_TILE_N 128
 #define BLOCK_TILE_K 32
 
-#define WARP_TILE_M 64
-#define WARP_TILE_N 64
+#define WARP_TILE_M 32 // 128 / 32 = 4. 4 * 4 = 16 warps
+#define WARP_TILE_N 32
 #define WARP_TILE_K 16
 
 #define WMMA_TILE_M 16
@@ -51,38 +51,31 @@ __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
 }
 
 __device__ void loadShmemA(half* shmem, half *A, int m, int k, int ko) {
-    for (int i = 0; i < ((BLOCK_TILE_M * BLOCK_TILE_K) / BLOCK_SIZE) / 8; i++) {
-        int row = i * 32 + threadIdx.x / 4;
-        int col = 8 * (threadIdx.x % 4);
-        asm volatile(
-            "cp.async.ca.shared.global [%0], [%1], 16;\n"
-            ::
-            "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_K / WMMA_TILE_K) * WMMA_TILE_M * (WMMA_TILE_K)) + (col / WMMA_TILE_K) * (WMMA_TILE_M * (WMMA_TILE_K)) + (row % WMMA_TILE_M) * (WMMA_TILE_K) + col % WMMA_TILE_K)), "l"(&A[(blockIdx.x * BLOCK_TILE_M + row) * k + ko * BLOCK_TILE_K + col])
-        );
-    }
+    // 512 threads load 128 x 32 halves. each thread load 8 halves(16 bytes), a single cp.async ..., 16
+    int row = threadIdx.x / 4; // [0, 127]
+    int col = 8 * (threadIdx.x % 4);
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        ::
+        "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_K / WMMA_TILE_K) * WMMA_TILE_M * (WMMA_TILE_K)) + (col / WMMA_TILE_K) * (WMMA_TILE_M * (WMMA_TILE_K)) + (row % WMMA_TILE_M) * (WMMA_TILE_K) + col % WMMA_TILE_K)), "l"(&A[(blockIdx.x * BLOCK_TILE_M + row) * k + ko * BLOCK_TILE_K + col])
+    );
 }
 
 __device__ void loadShmemB(half* shmem, half *B, int k, int n, int ko) {
-    for (int i = 0; i < (BLOCK_TILE_K * BLOCK_TILE_N) / (WARP_SIZE * WARP_NUM) / 2; i++) {
-        int row = i * 2 + threadIdx.x / 64;
-        int col = 2 * (threadIdx.x % 64);
-        asm volatile(
-            "cp.async.ca.shared.global [%0], [%1], 4;\n"
-            ::
-            "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_K) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_K * (WMMA_TILE_N)) + (col / WMMA_TILE_N) * (WMMA_TILE_K * (WMMA_TILE_N)) + (row % WMMA_TILE_K) * (WMMA_TILE_N) + col % (WMMA_TILE_N))), "l"(&B[(ko * BLOCK_TILE_K + row) * n + blockIdx.y * BLOCK_TILE_N + col])
-        );                
-    }
+    // 512 threads load 32 x 128 halves. each thread load 8 halves(16 bytes), a single cp.async ..., 16
+    int row = threadIdx.x / 16;
+    int col = 8 * (threadIdx.x % 16);
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        ::
+        "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_K) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_K * (WMMA_TILE_N)) + (col / WMMA_TILE_N) * (WMMA_TILE_K * (WMMA_TILE_N)) + (row % WMMA_TILE_K) * (WMMA_TILE_N) + col % (WMMA_TILE_N))), "l"(&B[(ko * BLOCK_TILE_K + row) * n + blockIdx.y * BLOCK_TILE_N + col])
+    );                
 }
 
 __device__ void loadFragA_mma(uint32_t* frag, half *shmem, int ki) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
+    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / (BLOCK_TILE_M / WARP_TILE_M); // 0, 1, 2, 3
     uint32_t lane_id = threadIdx.x % WARP_SIZE;
-    for (int i = 0; i < 4; i++) {       // Warp do 64x16, 16x16 a time, so 4 times
-        // for (int j = 0; j < 4; j++) {   // for every 16x16, every thread load 4 1x2 data
-        //     int row = warp_id_x * WARP_TILE_M + i * WMMA_TILE_M + (j / 2) * 8 + (lane_id / 4);
-        //     int col = ki * WMMA_TILE_K + (j % 2) * 8 + (lane_id % 4) * 2;
-        //     frag[i * 4 + j] = *(uint32_t*)(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_K / WMMA_TILE_K) * WMMA_TILE_M * (WMMA_TILE_K)) + (col / WMMA_TILE_K) * (WMMA_TILE_M * (WMMA_TILE_K)) + (row % WMMA_TILE_M) * (WMMA_TILE_K) + col % WMMA_TILE_K);
-        // }
+    for (int i = 0; i < (WARP_TILE_M / WMMA_TILE_M); i++) {
         int row = warp_id_x * WARP_TILE_M + i * 16 + (lane_id % 16);
         int col = ki * WARP_TILE_K + (lane_id / 16) * 8;
         asm volatile (
@@ -94,20 +87,10 @@ __device__ void loadFragA_mma(uint32_t* frag, half *shmem, int ki) {
 }
 
 __device__ void loadFragB_mma(uint32_t* frag, half *shmem, int ki) {
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
+    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % (BLOCK_TILE_N / WARP_TILE_N); // 0, 1, 2, 3
     uint32_t lane_id = threadIdx.x % WARP_SIZE;
-    // for (int i = 0; i < 8; i++) {       // Warp do 16x64, 16x8 a time, so 8 times
-    //     for (int j = 0; j < 2; j++) {   // for every 16x8, every thread load 2 1x2 data
-    //         int row = ki * WARP_TILE_K + j * 8 + (lane_id / 4);
-    //         int col = warp_id_y * WARP_TILE_N + i * 8 + (lane_id % 4) * 2;
-    //         frag[i * 2 + j] = *(uint32_t*)(shmem + (row / WMMA_TILE_K) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_K * (WMMA_TILE_N)) + (col / WMMA_TILE_N) * (WMMA_TILE_K * (WMMA_TILE_N)) + (row % WMMA_TILE_K) * (WMMA_TILE_N) + col % (WMMA_TILE_N));
-    //     }
-    //     // Can directly use ldmatrix.trans
-    //     asm volatile ("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(frag[i * 2]) : "r"(frag[i * 2]));
-    //     asm volatile ("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(frag[i * 2 + 1]) : "r"(frag[i * 2]));
-    // }
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < (WARP_TILE_N / WMMA_TILE_N); i++) {
         int row = ki * WARP_TILE_K + (lane_id % 16);
         int col = warp_id_y * WARP_TILE_N + i * 16 + (lane_id / 16) * 8;
         asm volatile (
@@ -136,16 +119,16 @@ __device__ void compute_mma(uint32_t* A, uint32_t* B, uint32_t* C) {
 }
 
 __device__ void storeFragC_mma(half* shmem, uint32_t* frag) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
+    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / (BLOCK_TILE_M / WARP_TILE_M);
+    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % (BLOCK_TILE_N / WARP_TILE_N);
     uint32_t lane_id = threadIdx.x % WARP_SIZE;
-    for (int i = 0; i < 4; i++) {           // 4 rows
-        for (int j = 0; j < 8; j++) {       // 8 cols
+    for (int i = 0; i < (WARP_TILE_M / 16); i++) {           // 4 rows -> WARP_TILE_M / 16 rows (=2)
+        for (int j = 0; j < (WARP_TILE_N / 8); j++) {       // 8 cols -> WARP_TILE_N / 8 rows (=4)
             for (int k = 0; k < 2; k++) {   // 2 frags
                 int row = warp_id_x * WARP_TILE_M + i * WMMA_TILE_M + k * 8 + (lane_id / 4);
                 int col = warp_id_y * WARP_TILE_N + j * 8 + (lane_id % 4) * 2;
                 *(uint32_t*)(shmem + (row / WMMA_TILE_M) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_M * WMMA_TILE_N) + (col / WMMA_TILE_N) * (WMMA_TILE_M * WMMA_TILE_N) + (row % WMMA_TILE_M) * (WMMA_TILE_N) + (col % WMMA_TILE_N)) = 
-                frag[i * 8 * 2 + j * 2 + k];
+                frag[i * (WARP_TILE_N / 8) * 2 + j * 2 + k];
             }
         }
     }
@@ -161,32 +144,35 @@ __device__ void storeShmemC(half *C, half* shmem, int m, int n) {
 }
 
 __device__ void storeC(half* C, uint32_t* frag, int m, int n) {
-    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / 2;
-    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
+    // may be problematic
+    uint32_t warp_id_x = (threadIdx.x / WARP_SIZE) / (WARP_TILE_M / WMMA_TILE_M);
+    uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % (WARP_TILE_N / WMMA_TILE_N);
     uint32_t lane_id = threadIdx.x % WARP_SIZE;
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < (WARP_TILE_M / 16); i++) {
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
+        for (int j = 0; j < (WARP_TILE_N / 8); j++) {
             *(uint32_t*)(&C[(blockIdx.x * BLOCK_TILE_M + warp_id_x * WARP_TILE_M + i * MMA_TILE_M + (lane_id / 4) + 0) * n + (blockIdx.y * BLOCK_TILE_N + warp_id_y * WARP_TILE_N + j * MMA_TILE_N + (lane_id % 4) * 2)]) = 
-            *(uint32_t*)(&frag[(i * 8 + j) * 2 + 0]);
+            *(uint32_t*)(&frag[(i * (WARP_TILE_N / 8) + j) * 2 + 0]);
             *(uint32_t*)(&C[(blockIdx.x * BLOCK_TILE_M + warp_id_x * WARP_TILE_M + i * MMA_TILE_M + (lane_id / 4) + 8) * n + (blockIdx.y * BLOCK_TILE_N + warp_id_y * WARP_TILE_N + j * MMA_TILE_N + (lane_id % 4) * 2)]) = 
-            *(uint32_t*)(&frag[(i * 8 + j) * 2 + 1]);
+            *(uint32_t*)(&frag[(i * (WARP_TILE_N / 8) + j) * 2 + 1]);
         }
     }
 }
 
 __device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook, half* codebook_shmem, int k, int n, int ko) {
-    // 32x64 uint8, every thread load 16 uint8 indices
-    uint32_t local_id = (threadIdx.x % 4) * 4;
+    // 32x64 uint8, 512 threads, every thread dequant 4 uint8_t
+    int tid = threadIdx.x;
+    uint32_t row = tid / 16; // [0, 32] 
+    uint32_t col = tid % 16 * 4; // 4 * [0, 15]
+    uint32_t local_idx = col / 4;
 
-    uint8_t indices[16];
-    *(uint64_t*)(&indices[0]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16]);
-    *(uint64_t*)(&indices[8]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16 + 8]);
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        *(uint32_t*)(&shmem[(threadIdx.x / 64) * (8 * 16 * 16) + (threadIdx.x % 4 * 16 + i) * 2 / 16 * (16 * 16) + (threadIdx.x / 4) % 16 * 16 + (threadIdx.x % 4 * 8 + i) * 2 % 16]) = *(uint32_t*)(&codebook_shmem[(local_id + i / 4) * 256 * RATIO + ((uint32_t) indices[i]) * RATIO]);
-    }
+    uint8_t indices[4];
+    *(uint32_t*)(&indices[0]) = *(uint32_t*)(&B_q[(ko * BLOCK_TILE_K + row) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + col]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + col * RATIO / 16 * (16 * 16) + row % 16 * 16 + (col * RATIO) % 16]) = *(uint32_t*)(&codebook_shmem[local_idx * 256 * RATIO + ((uint32_t) indices[0]) * RATIO]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + (col + 1) * RATIO / 16 * (16 * 16) + row % 16 * 16 + ((col + 1) * RATIO) % 16]) = *(uint32_t*)(&codebook_shmem[local_idx * 256 * RATIO + ((uint32_t) indices[1]) * RATIO]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + (col + 2) * RATIO / 16 * (16 * 16) + row % 16 * 16 + ((col + 2) * RATIO) % 16]) = *(uint32_t*)(&codebook_shmem[local_idx * 256 * RATIO + ((uint32_t) indices[2]) * RATIO]);
+    *(uint32_t*)(&shmem[row / 16 * (8 * 16 * 16) + (col + 3) * RATIO / 16 * (16 * 16) + row % 16 * 16 + ((col + 3) * RATIO) % 16]) = *(uint32_t*)(&codebook_shmem[local_idx * 256 * RATIO + ((uint32_t) indices[3]) * RATIO]);
 }
 
 __device__ void load_codebook(
@@ -194,20 +180,24 @@ __device__ void load_codebook(
     half* codebook
 )
 {
+    int tid = threadIdx.x;
+
     uint32_t codebook_begin_row = blockIdx.y * 16;
     // Assuming HOT is less than 16
-    uint32_t iters_to_load = ((16 * ENTRY * RATIO / HOT) / 8) / BLOCK_SIZE;
-    uint32_t load_cols = (ENTRY * RATIO / HOT) / 8;
-    uint32_t load_rows = BLOCK_SIZE / load_cols;
+    // uint32_t iters_to_load = ((16 * ENTRY * RATIO / HOT) / 8) / BLOCK_SIZE; // = 2
+    uint32_t load_cols = (ENTRY * RATIO) / 8; // = 64
+    uint32_t load_rows = (WARP_NUM * WARP_SIZE) / load_cols; // = 8
 
-    #pragma unroll
-    for (int i = 0; i < iters_to_load; i++) {
-        asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n"
-        :
-        : "r"(shmem_uint32_t(&shmem[(i * load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO / HOT) + (threadIdx.x % load_cols) * 8])),
-          "l"(&codebook[(codebook_begin_row + i * load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
-        );
-    }
+    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n" 
+    :
+    :   "r"(shmem_uint32_t(&shmem[(tid / load_cols) * (ENTRY * RATIO) + (tid % load_cols) * 8])), 
+        "l"(&codebook[(codebook_begin_row + tid / load_cols) * (ENTRY * RATIO) + (tid % load_cols) * 8])
+    );
+    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n" 
+    :
+    :   "r"(shmem_uint32_t(&shmem[(load_rows + tid / load_cols) * (ENTRY * RATIO) + (tid % load_cols) * 8])),
+        "l"(&codebook[(load_rows + codebook_begin_row + tid / load_cols) * (ENTRY * RATIO) + (tid % load_cols) * 8])
+    );
 }
 
 __global__ void e2e_gemm_kernel(
@@ -221,11 +211,12 @@ __global__ void e2e_gemm_kernel(
     extern __shared__ uint8_t shmem[];
     half *A1 = reinterpret_cast<half*>(shmem);
     half *B1 = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
+    half *C_buf = reinterpret_cast<half*>(shmem);
     half *codebook_buf = reinterpret_cast<half*>(shmem + (BLOCK_TILE_M * BLOCK_TILE_K + BLOCK_TILE_K * BLOCK_TILE_N) * sizeof(half));
 
-    uint32_t A_frags[16];
-    uint32_t B_frags[16];
-    uint32_t C_frags[64] = {0};
+    uint32_t A_frags[8];
+    uint32_t B_frags[8];
+    uint32_t C_frags[16] = {0};
 
     // Load codebook
     load_codebook(codebook_buf, _codebook);
@@ -243,13 +234,15 @@ __global__ void e2e_gemm_kernel(
             // dequantToRegB(B_frags, _w, _codebook, codebook_buf, K, N, ko, ki);
             for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
                 for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
-                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * (WARP_TILE_M / WMMA_TILE_M) + nn) * 4]);
                 }
             }
         }
         __syncthreads();
     }
-    storeC(_o, C_frags, M, N * RATIO);    
+    storeFragC_mma(C_buf, C_frags);
+    __syncthreads();
+    storeShmemC(_o, C_buf, M, N * RATIO);   
 }
 
 torch::Tensor e2e_gemm(
@@ -327,9 +320,9 @@ __global__ void gemm_kernel(
     half *B1 = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
     half *C_buf = reinterpret_cast<half*>(shmem);
 
-    uint32_t A_frags[16];
-    uint32_t B_frags[16];
-    uint32_t C_frags[64] = {0};
+    uint32_t A_frags[8];
+    uint32_t B_frags[8];
+    uint32_t C_frags[16] = {0};
 
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
         loadShmemA(A1, _input, M, K, ko); // cp.async
@@ -341,7 +334,7 @@ __global__ void gemm_kernel(
             loadFragB_mma(B_frags, B1, ki);
             for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
                 for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
-                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * (WARP_TILE_M / WMMA_TILE_M) + nn) * 4]);
                 }
             }
         }

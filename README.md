@@ -14,7 +14,7 @@ Then run `make compile` to compile all kernels.
 - `make try-<version>`: compile and run test of the corresponding version vq-gemm kernel.
 - `make run-<version>`: run test of the corresponding version vq-gemm kernel without compile.
 - `make run-gemm-128`: run benchmark of gemm in compiled `s1`
-- `make run-gemm-1024`: run benchmark of gemm in compiled `s2_1024` (NOT IMPLMENTED YET)
+- `make run-gemm-512`: run benchmark of gemm in compiled `s2-512`
 - `make prof-<version>`: run ncu profile of \<version\> vq-gemm kernel. ncu_reports will be in `ncu_reports/` directory.
     - Revise prof_cmd to activate your conda env    
 
@@ -23,4 +23,3 @@ Error heat map are generated in ./figures/
 
 ## TODO
 - [ ] optimize `s2-128`. Currently for M, N, K = (4096, 2048, 4096), `s1` has 195.45TFLOPS while `s2` has only 156.292TFLOPS
-- [ ] `s2-512`
