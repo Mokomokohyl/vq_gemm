@@ -37,7 +37,7 @@
 #define CODEBOOK_BUFFERING 1
 
 // A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
-#define MAX_SHARED_MEMORY_USAGE (16384 + CODEBOOK_BUFFERING * (32768 / HOT))
+#define MAX_SHARED_MEMORY_USAGE (16384 * 2 + CODEBOOK_BUFFERING * (32768 / HOT))
 __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     uint32_t addr;
     asm volatile(
@@ -325,17 +325,33 @@ __global__ void gemm_kernel(
     extern __shared__ uint8_t shmem[];
     half *A1 = reinterpret_cast<half*>(shmem);
     half *B1 = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
+    half *A2 = reinterpret_cast<half*>(shmem + (BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
+    half *B2 = reinterpret_cast<half*>(shmem + (2 * BLOCK_TILE_M + BLOCK_TILE_N) * BLOCK_TILE_K * sizeof(half));
     half *C_buf = reinterpret_cast<half*>(shmem);
 
     uint32_t A_frags[16];
     uint32_t B_frags[16];
     uint32_t C_frags[64] = {0};
+    
+    // prologue: ko = 0. fill buffer 1
+    loadShmemA(A1, _input, M, K, 0);
+    loadShmemB(B1, _w, K, N, 0);
+    asm volatile("cp.async.commit_group; \n" ::);
+    __syncthreads();
 
-    for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
-        loadShmemA(A1, _input, M, K, ko); // cp.async
-        loadShmemB(B1, _w, K, N, ko);
-        asm volatile("cp.async.wait_all;\n"::);
+    // main pipeline: 1, 2, ..., K / BLOCK_TILE_K / 2 * 2 - 2
+    for (int ko = 1; ko < (K / BLOCK_TILE_K) / 2 * 2 - 2; ko += 2) {
+
+        // launch buffer 2 loading
+        loadShmemA(A2, _input, M, K, ko); // cp.async
+        loadShmemB(B2, _w, K, N, ko);
+        asm volatile("cp.async.commit_group; \n" ::);
+
+        // wait for buffer 1
+        asm volatile("cp.async.wait_group %0; \n" ::"n"(1));
         __syncthreads();
+
+        // consume buffer 1
         for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
             loadFragA_mma(A_frags, A1, ki);
             loadFragB_mma(B_frags, B1, ki);
@@ -345,8 +361,95 @@ __global__ void gemm_kernel(
                 }
             }
         }
+        // launch buffer 1 loading
+        loadShmemA(A1, _input, M, K, ko + 1); // cp.async
+        loadShmemB(B1, _w, K, N, ko + 1);
+        asm volatile("cp.async.commit_group; \n" ::);
+
+        // wait for buffer 2
+        asm volatile("cp.async.wait_group %0; \n" ::"n"(1));
         __syncthreads();
+
+        // consume buffer 2
+        for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
+            loadFragA_mma(A_frags, A2, ki);
+            loadFragB_mma(B_frags, B2, ki);
+            for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
+                for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
+                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+                }
+            }
+        }
     }
+
+    // epilogue: ko = K / BLOCK_TILE_K / 2 * 2 - 1, ..., K / BLOCK_TILE_K - 1
+    int ko = (K / BLOCK_TILE_K) / 2 * 2 - 1;
+    // launch buffer 2 loading
+    loadShmemA(A2, _input, M, K, ko); // cp.async
+    loadShmemB(B2, _w, K, N, ko);
+    asm volatile("cp.async.commit_group; \n" ::);
+    // wait for buffer 1
+    asm volatile("cp.async.wait_group %0; \n" ::"n"(1));
+    __syncthreads();
+
+    // consume buffer 1
+    for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
+        loadFragA_mma(A_frags, A1, ki);
+        loadFragB_mma(B_frags, B1, ki);
+        for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
+            for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
+                compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+            }
+        }
+    }
+    if ((ko + 1) < K / BLOCK_TILE_K) {
+        // launch buffer 1 loading
+        loadShmemA(A1, _input, M, K, ko + 1); // cp.async
+        loadShmemB(B1, _w, K, N, ko + 1);
+        asm volatile("cp.async.commit_group; \n" ::);
+        // wait for buffer 2
+        asm volatile("cp.async.wait_group %0; \n" ::"n"(1));
+        __syncthreads();
+        // consume buffer 2
+        for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
+            loadFragA_mma(A_frags, A2, ki);
+            loadFragB_mma(B_frags, B2, ki);
+            for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
+                for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
+                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+                }
+            }
+        }
+        // wait for buffer 1
+        asm volatile("cp.async.wait_group %0; \n" ::"n"(0));
+        __syncthreads();
+        // consume buffer 1
+        for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
+            loadFragA_mma(A_frags, A1, ki);
+            loadFragB_mma(B_frags, B1, ki);
+            for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
+                for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
+                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+                }
+            }
+        }
+    } else {
+        // wait for buffer 2
+        asm volatile("cp.async.wait_group %0; \n" ::"n"(0));
+        __syncthreads();
+        // consume buffer 2
+        for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
+            loadFragA_mma(A_frags, A2, ki);
+            loadFragB_mma(B_frags, B2, ki);
+            for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
+                for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
+                    compute_mma(&A_frags[mm * 4], &B_frags[nn * 4], &C_frags[(mm * 4 + nn) * 4]);
+                }
+            }
+        }
+    }
+
+
     storeFragC_mma(C_buf, C_frags);
     __syncthreads();
     storeShmemC(_o, C_buf, M, N);   
@@ -364,7 +467,7 @@ torch::Tensor gemm(
     cudaEventCreate(&st);
     cudaEventCreate(&ed);
 #endif
-    cudaFuncSetAttribute(e2e_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
+    cudaFuncSetAttribute(gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
     // Assuming M is padded to 128, pad at torch level.
 
     auto M = input.size(0);
