@@ -259,7 +259,7 @@ torch::Tensor gemm(
     float ms;
     cudaEventElapsedTime(&ms, st, ed);
     std::cout << "Latency: " << ms / (1.0 * iter) << std::endl;
-    std::cout << "TFLOPS : " << ((2.0 * M * N * K * RATIO) / ((ms / (1.0 * iter)) / (1000.0))) / (1024.0 * 1024.0 * 1024.0 * 1024.0) << std::endl;
+    std::cout << "TFLOPS : " << ((2.0 * M * N * K) / ((ms / (1.0 * iter)) / (1000.0))) / (1024.0 * 1024.0 * 1024.0 * 1024.0) << std::endl;
 #endif
     return o;
 }
