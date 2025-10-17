@@ -1,7 +1,8 @@
 ## vq-gemm experiments
 
 ### Environment
-conda env with torch and matplotlib
+CUDA 12.8
+Conda env with torch
 
 ### Run tests
 
@@ -19,7 +20,3 @@ Then run `make compile` to compile all kernels.
     - Revise prof_cmd to activate your conda env    
 
 Terminal outputs are redirected to ./logs/bench_\<version\>.log  
-Error heat map are generated in ./figures/
-
-## TODO
-- [ ] optimize `s2-128`. Currently for M, N, K = (4096, 2048, 4096), `s1` has 195.45TFLOPS while `s2` has only 156.292TFLOPS
