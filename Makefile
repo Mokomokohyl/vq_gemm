@@ -50,6 +50,9 @@ run-s3-naive:;$(MAKE) run KERNELS=s3_naive
 try-s3-wasp:;$(MAKE) try KERNELS=s3_wasp
 run-s3-wasp:;$(MAKE) run KERNELS=s3_wasp
 
+try-s3-bs:;$(MAKE) try KERNELS=s3_bs
+run-s3-bs:;$(MAKE) run KERNELS=s3_bs
+
 prof-s1:;$(MAKE) profile KERNELS=s1
 prof-s2-128:;$(MAKE) profile KERNELS=s2_128
 prof-s2-512:;$(MAKE) profile KERNELS=s2_512
@@ -59,5 +62,6 @@ prof-s3-wasp:;$(MAKE) profile KERNELS=s3_wasp
 run-gemm-128:; TEST_GEMM=TRUE KERNELS=s1 python bench.py > ./logs/bench_gemm_128.log 2>&1
 run-gemm-s2:; TEST_GEMM=TRUE KERNELS=s2_128 python bench.py > ./logs/bench_gemm_128.log 2>&1
 run-gemm-512:; TEST_GEMM=TRUE KERNELS=s2_512 python bench.py > ./logs/bench_gemm_512.log 2>&1
+run-gemm-bs:; TEST_GEMM=TRUE KERNELS=s3_bs python bench.py > ./logs/bench_gemm_bs.log 2>&1
 
 .PHONY: run compile try clean clean-logs try-s1 run-s1 try-s2-128 run-s2-128 try-s2-1024 run-s2-1024 try-s3 run-s3

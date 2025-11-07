@@ -8,6 +8,7 @@ import vq_gemm_cuda_s2_128
 import vq_gemm_cuda_s2_512
 import vq_gemm_cuda_s3_naive
 import vq_gemm_cuda_s3_wasp
+import vq_gemm_cuda_s3_bs
 
 M = 2048
 K = 4096
@@ -22,7 +23,8 @@ module_dict = {
     "s2_128": vq_gemm_cuda_s2_128,
     "s2_512": vq_gemm_cuda_s2_512,
     "s3_naive": vq_gemm_cuda_s3_naive,
-    "s3_wasp": vq_gemm_cuda_s3_wasp
+    "s3_wasp": vq_gemm_cuda_s3_wasp,
+    "s3_bs": vq_gemm_cuda_s3_bs
 }
 module = module_dict[kernel_to_use_str]
 ENTRY = 256
@@ -136,16 +138,10 @@ def main():
         print(f"Max abs diff: {max_val.item()}, at ({max_row}, {max_col})")
 
         abs_diff_np = abs_diff.cpu().numpy()
-        plt.imshow(abs_diff_np, aspect='auto', cmap='viridis')
-        plt.colorbar()
-        plt.title("Absolute Error Heatmap")
 
         # 叠加误差>1的位置为白色点
         mask = abs_diff_np > 1
         ys, xs = np.where(mask)
-        plt.scatter(xs, ys, color='white', s=1)  # s=1为点大小，可适当调大
-
-        plt.savefig(f"./figures/M={M}_N={N}_K={K}_err.png")
 
         ys, xs = np.where(mask)
         output_cuda_np = output_cuda.cpu().numpy()

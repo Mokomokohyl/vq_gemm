@@ -14,6 +14,7 @@ nvcc_flags = {
     's2_512': base_nvcc_flags,
     's3_naive': base_nvcc_flags + ['--maxrregcount=128'],
     's3_wasp': base_nvcc_flags + ['--maxrregcount=64', '-lcuda'],
+    's3_bs': base_nvcc_flags
 }
 source = {
     'cublas_gemm': [
@@ -43,6 +44,11 @@ source = {
             [
                 'bind.cpp',
                 './strategy_3/wasp/src.cu',
+            ],
+    's3_bs':
+            [
+                'bind.cpp',
+                './strategy_3/bs/src.cu',
             ]
 }
 
