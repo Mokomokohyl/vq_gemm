@@ -53,7 +53,7 @@ torch::Tensor e2e_gemm(
     torch::Tensor qweight,
     torch::Tensor scales,
     torch::Tensor qzeros,
-    int64_t group_size
+    int group_size
 )
 {
     auto M = input.size(0);
