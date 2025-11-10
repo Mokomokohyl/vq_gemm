@@ -7,11 +7,11 @@ import vq_gemm_cuda_cublas_gemm
 
 M = 2048
 K = 4096
-N = 640
+N = 1280
 profiling = (os.getenv('PROFILING', 'FALSE') == 'TRUE')
 run_vq_gemm = not (os.getenv('TEST_GEMM', 'FALSE') == 'TRUE')
 if not run_vq_gemm:
-    M = N = K = 4096
+   M = N = K = 4096
 kernel_to_use_str = os.getenv('KERNELS', 'all')
 module = importlib.import_module("vq_gemm_cuda_" + kernel_to_use_str)
 
@@ -66,7 +66,8 @@ def vq_gemm_reference(
     group_size: int,
 ) -> torch.Tensor:
     w_decoded = awq_dequantize_torch(qweight, scales, qzeros, group_size)
-    return vq_gemm_cuda_cublas_gemm.gemm(input, w_decoded.to(input.dtype).contiguous())
+    return vq_gemm_cuda_cublas_gemm.gemm(input, w_decoded)
+    # return w_decoded
 
 def gemm_ref(input, w):
     return vq_gemm_cuda_cublas_gemm.gemm(input, w)
@@ -149,6 +150,18 @@ def main():
         print(f"Max abs diff: {max_val.item()}, at ({max_row}, {max_col})")
 
         abs_diff_np = abs_diff.cpu().numpy()
+
+        plt = _ensure_matplotlib()
+        plt.imshow(abs_diff_np, aspect='auto', cmap='viridis')
+        plt.colorbar()
+        plt.title("Absolute Error Heatmap")
+
+        # 叠加误差>1的位置为白色点
+        mask = abs_diff_np > 1
+        ys, xs = np.where(mask)
+        plt.scatter(xs, ys, color='white', s=1)  # s=1为点大小，可适当调大
+
+        plt.savefig(f"./M={M}_N={N}_K={K}_err.png")
 
         outs_cuda = []
         outs_ref = []

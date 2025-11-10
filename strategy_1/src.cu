@@ -375,6 +375,8 @@ torch::Tensor e2e_gemm(
     std::cout << "Latency: " << ms / (1.0 * iter) << std::endl;
     std::cout << "TFLOPS : " << ((2.0 * M * N * K) / ((ms / (1.0 * iter)) / (1000.0))) / (1024.0 * 1024.0 * 1024.0 * 1024.0) << std::endl;
 #endif
+    // check dequant correctness:
+    // return B;
     return o;
 }
 

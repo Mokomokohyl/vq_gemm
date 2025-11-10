@@ -13,10 +13,6 @@
 #define WARP_NUM 4
 #define WARP_SIZE 32
 #define BLOCK_SIZE (WARP_NUM * WARP_SIZE)
-#define ENTRY 256
-#define RATIO 2
-#define RESIDUAL 1
-#define HOT 1
 
 #define BLOCK_TILE_M 128
 #define BLOCK_TILE_N 128
@@ -34,10 +30,8 @@
 #define MMA_TILE_N 8
 #define MMA_TILE_K 16
 
-#define CODEBOOK_BUFFERING 1
-
-// A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
-#define MAX_SHARED_MEMORY_USAGE (16384 * 2 + CODEBOOK_BUFFERING * (32768 / HOT))
+// A + B = 16384
+#define MAX_SHARED_MEMORY_USAGE (16384 * 2)
 __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     uint32_t addr;
     asm volatile(
@@ -176,61 +170,33 @@ __device__ void storeC(half* C, uint32_t* frag, int m, int n) {
     }
 }
 
-__device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook, half* codebook_shmem, int k, int n, int ko) {
-    // 32x64 uint8, every thread load 16 uint8 indices
-    uint32_t local_id = (threadIdx.x % 4) * 4;
-
-    uint8_t indices[16];
-    *(uint64_t*)(&indices[0]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16]);
-    *(uint64_t*)(&indices[8]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16 + 8]);
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        *(uint32_t*)(&shmem[(threadIdx.x / 64) * (8 * 16 * 16) + (threadIdx.x % 4 * 16 + i) * 2 / 16 * (16 * 16) + (threadIdx.x / 4) % 16 * 16 + (threadIdx.x % 4 * 8 + i) * 2 % 16]) = *(uint32_t*)(&codebook_shmem[(local_id + i / 4) * 256 * RATIO + ((uint32_t) indices[i]) * RATIO]);
-    }
-}
-
-__device__ void load_codebook(
+__device__ void dequantToShmemB(
     half* shmem,
-    half* codebook
-)
-{
-    uint32_t codebook_begin_row = blockIdx.y * 16;
-    // Assuming HOT is less than 16
-    uint32_t iters_to_load = ((16 * ENTRY * RATIO / HOT) / 8) / BLOCK_SIZE;
-    uint32_t load_cols = (ENTRY * RATIO / HOT) / 8;
-    uint32_t load_rows = BLOCK_SIZE / load_cols;
-
-    #pragma unroll
-    for (int i = 0; i < iters_to_load; i++) {
-        asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n"
-        :
-        : "r"(shmem_uint32_t(&shmem[(i * load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO / HOT) + (threadIdx.x % load_cols) * 8])),
-          "l"(&codebook[(codebook_begin_row + i * load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
-        );
-    }
+    const int32_t* __restrict__ qweight, // [K, N // 8]
+    const half* __restrict__ scales,     // [K // group_size, N]
+    const int32_t* __restrict__ qzeros,  // [K // group_size, N // 8]
+    int k, int n, int ko) {
+    // AWQ dequant 32 x 16 int32_t -> 32 x 128 fp16. 128 threads
+    // each thread dequant 4 uint32_t
+    
 }
 
 __global__ void e2e_gemm_kernel(
     half* _input,
-    uint8_t* _w,
-    half* _codebook,
+    const int32_t* __restrict__ qweight, // [K, N // 8]
+    const half* __restrict__ scales,     // [K // group_size, N]
+    const int32_t* __restrict__ qzeros,  // [K // group_size, N // 8]
     half* _o,
-    int M, int N, int K
+    int M, int N, int K, int group_size
 )
 {
     extern __shared__ uint8_t shmem[];
     half *A1 = reinterpret_cast<half*>(shmem);
     half *B1 = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
-    half *codebook_buf = reinterpret_cast<half*>(shmem + (BLOCK_TILE_M * BLOCK_TILE_K + BLOCK_TILE_K * BLOCK_TILE_N) * sizeof(half));
 
     uint32_t A_frags[16];
     uint32_t B_frags[16];
     uint32_t C_frags[64] = {0};
-
-    // Load codebook
-    load_codebook(codebook_buf, _codebook);
-    asm volatile("cp.async.wait_all;\n"::);
-    __syncthreads();
 
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
         loadShmemA(A1, _input, M, K, ko);
@@ -254,8 +220,10 @@ __global__ void e2e_gemm_kernel(
 
 torch::Tensor e2e_gemm(
     torch::Tensor input,
-    torch::Tensor w,
-    torch::Tensor codebook
+    torch::Tensor qweight,
+    torch::Tensor scales,
+    torch::Tensor qzeros,
+    int group_size
 )
 {
 #if PROFILING == 1
@@ -270,15 +238,15 @@ torch::Tensor e2e_gemm(
 
     auto M = input.size(0);
     auto K = input.size(1);
-    auto N = w.size(1);
+    auto N = qweight.size(1) * 8;
     std::cout << M << " " << K << " " << N << std::endl;
     auto options = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA, 0);
-    torch::Tensor o = torch::full({M, N * RATIO}, 0, options);
+    torch::Tensor o = torch::full({M, N}, 0, options);
 
     half* input_ptr = reinterpret_cast<half*>(input.data_ptr<at::Half>());
-
-    uint8_t* w_ptr = reinterpret_cast<uint8_t*>(w.data_ptr<uint8_t>());
-    half* codebook_ptr = reinterpret_cast<half*>(codebook.data_ptr<at::Half>());
+    const int32_t* qweight_ptr = reinterpret_cast<const int32_t*>(qweight.data_ptr<int32_t>());
+    const half* scales_ptr = reinterpret_cast<const half*>(scales.data_ptr<at::Half>());
+    const int32_t* qzeros_ptr = reinterpret_cast<const int32_t*>(qzeros.data_ptr<int32_t>());
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
 
     dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
@@ -287,10 +255,11 @@ torch::Tensor e2e_gemm(
     for (int i = 0; i < wmup; i++) {
         e2e_gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
             input_ptr, 
-            w_ptr,
-            codebook_ptr, 
+            qweight_ptr,
+            scales_ptr,
+            qzeros_ptr,
             o_ptr,
-            M, N, K
+            M, N, K, group_size
         );
     }
     cudaEventRecord(st);
@@ -301,7 +270,7 @@ torch::Tensor e2e_gemm(
             w_ptr,
             codebook_ptr, 
             o_ptr,
-            M, N, K
+            M, N, K, group_size
         );
 #if PROFILING == 1
     }
