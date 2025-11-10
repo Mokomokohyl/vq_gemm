@@ -175,10 +175,43 @@ __device__ void dequantToShmemB(
     const int32_t* __restrict__ qweight, // [K, N // 8]
     const half* __restrict__ scales,     // [K // group_size, N]
     const int32_t* __restrict__ qzeros,  // [K // group_size, N // 8]
-    int k, int n, int ko) {
+    int K, int N, int ko, int group_size) {
     // AWQ dequant 32 x 16 int32_t -> 32 x 128 fp16. 128 threads
-    // each thread dequant 4 uint32_t
-    
+    // each thread dequant contiguous 4 uint32_t -> 32 fp16
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane_id = tid & 31;
+
+    const int row = ko * BLOCK_TILE_K + warp_id * 8 + (lane_id / 4);
+    const int group_idx = row / group_size;
+    const int col_pack = blockIdx.y * (BLOCK_TILE_N / 8) + (lane_id % 4) * 4;
+    const int col_base = col_pack * 8;
+    const int N_pack = N / 8;
+
+    const int in_shmem_row = warp_id * 8 + (lane_id / 4);
+    const int in_shmem_col = lane_id % 4 * 32;
+
+    uint32_t packed_weight[4];
+    uint32_t packed_zero[4];
+    *(uint4*)(&packed_weight[0]) = *(uint4*)(&qweight[row * N_pack + col_pack]);
+    *(uint4*)(&packed_zero[0]) = *(uint4*)(&qzeros[group_idx * N_pack + col_pack]);
+    const half* scale_tile = scales + group_idx * N + col_base;
+
+    alignas(16) half decoded_vals[8];
+    for (int j = 0; j < 4; j++) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float w = static_cast<float>((packed_weight[j] >> (4 * i)) & 0xF);
+            const float z = static_cast<float>((packed_zero[j]   >> (4 * i)) & 0xF);
+            const float s = __half2float(scale_tile[j * 8 + i]);
+            decoded_vals[i] = __float2half_rn((w - z) * s);
+        }
+        *(uint4*)(&shmem[in_shmem_row           / 16 * (8 * 16 * 16) +
+                         (in_shmem_col + j * 8) / 16 * 16 * 16 + 
+                         in_shmem_row           % 16 * 16 + 
+                         (in_shmem_col + j * 8) % 16]) = 
+        *(uint4*)(decoded_vals);
+    }
 }
 
 __global__ void e2e_gemm_kernel(
@@ -200,7 +233,7 @@ __global__ void e2e_gemm_kernel(
 
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
         loadShmemA(A1, _input, M, K, ko);
-        dequantToShmemB(B1, _w, _codebook, codebook_buf, K, N, ko);
+        dequantToShmemB(B1, qweight, scales, qzeros, K, N, ko, group_size);
         asm volatile("cp.async.wait_all;\n"::);
         __syncthreads();
         for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
@@ -215,7 +248,7 @@ __global__ void e2e_gemm_kernel(
         }
         __syncthreads();
     }
-    storeC(_o, C_frags, M, N * RATIO);    
+    storeC(_o, C_frags, M, N);    
 }
 
 torch::Tensor e2e_gemm(
@@ -249,7 +282,7 @@ torch::Tensor e2e_gemm(
     const int32_t* qzeros_ptr = reinterpret_cast<const int32_t*>(qzeros.data_ptr<int32_t>());
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
 
-    dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
+    dim3 grid(M / BLOCK_TILE_M, N / BLOCK_TILE_N);
     dim3 block(BLOCK_SIZE);
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
@@ -267,8 +300,9 @@ torch::Tensor e2e_gemm(
 #endif
         e2e_gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
             input_ptr, 
-            w_ptr,
-            codebook_ptr, 
+            qweight_ptr,
+            scales_ptr,
+            qzeros_ptr,
             o_ptr,
             M, N, K, group_size
         );
@@ -279,7 +313,7 @@ torch::Tensor e2e_gemm(
     float ms;
     cudaEventElapsedTime(&ms, st, ed);
     std::cout << "Latency: " << ms / (1.0 * iter) << std::endl;
-    std::cout << "TFLOPS : " << ((2.0 * M * N * K * RATIO) / ((ms / (1.0 * iter)) / (1000.0))) / (1024.0 * 1024.0 * 1024.0 * 1024.0) << std::endl;
+    std::cout << "TFLOPS : " << ((2.0 * M * N * K) / ((ms / (1.0 * iter)) / (1000.0))) / (1024.0 * 1024.0 * 1024.0 * 1024.0) << std::endl;
 #endif
     return o;
 }
