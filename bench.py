@@ -151,18 +151,6 @@ def main():
 
         abs_diff_np = abs_diff.cpu().numpy()
 
-        plt = _ensure_matplotlib()
-        plt.imshow(abs_diff_np, aspect='auto', cmap='viridis')
-        plt.colorbar()
-        plt.title("Absolute Error Heatmap")
-
-        # 叠加误差>1的位置为白色点
-        mask = abs_diff_np > 1
-        ys, xs = np.where(mask)
-        plt.scatter(xs, ys, color='white', s=1)  # s=1为点大小，可适当调大
-
-        plt.savefig(f"./M={M}_N={N}_K={K}_err.png")
-
         outs_cuda = []
         outs_ref = []
         for i in range(5):
