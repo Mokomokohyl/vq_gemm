@@ -50,12 +50,14 @@ torch::Tensor gemm(
 // Should not be called
 torch::Tensor e2e_gemm(
     torch::Tensor input,
-    torch::Tensor w,
-    torch::Tensor codebook
+    torch::Tensor qweight,
+    torch::Tensor scales,
+    torch::Tensor qzeros,
+    int64_t group_size
 )
 {
     auto M = input.size(0);
-    auto N = w.size(1);
+    auto N = qweight.size(1) * 8;
     auto options = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA, 0);
     torch::Tensor o = torch::full({M, N}, 0, options);
     return o;

@@ -13,10 +13,6 @@
 #define WARP_NUM 4
 #define WARP_SIZE 32
 #define BLOCK_SIZE (WARP_NUM * WARP_SIZE)
-#define ENTRY 256
-#define RATIO 2
-#define RESIDUAL 1
-#define HOT 1
 
 #define BLOCK_TILE_M 128
 #define BLOCK_TILE_N 128
@@ -34,18 +30,14 @@
 #define MMA_TILE_N 8
 #define MMA_TILE_K 16
 
-#define CODEBOOK_BUFFERING 1
-
 // for dequant kernel
-#define DQ_BLOCK_SIZE 1024
+#define DQ_BLOCK_SIZE (WARP_SIZE * 16)
 #define DQ_BLOCK_TILE_N 128
 #define DQ_BLOCK_TILE_K 32
 
-// A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
-#define MAX_SHARED_MEMORY_USAGE (16384 + CODEBOOK_BUFFERING * (32768 / HOT))
-// uint8(1) -> half(2) + codebook
-#define DEQUANT_SHARED_MEMORY_USAGE (DQ_BLOCK_TILE_N * DQ_BLOCK_TILE_K * RATIO * 2 + DQ_BLOCK_TILE_N / 4 * ENTRY * RATIO * 2)
-#define GEMM_SHARED_MEMORY_USAGE (BLOCK_TILE_M * BLOCK_TILE_K * 2 + BLOCK_TILE_K * RATIO * BLOCK_TILE_N * 2)
+// A + B = 16384
+#define MAX_SHARED_MEMORY_USAGE (BLOCK_TILE_M * BLOCK_TILE_N * sizeof(half))
+#define DEQUANT_SHARED_MEMORY_USAGE 0
 __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     uint32_t addr;
     asm volatile(
@@ -264,66 +256,51 @@ torch::Tensor gemm(
     return o;
 }
 
-// each threadBlock load 32 x 128 uint8, each thread dequant 4 uint8 
-__global__ void dequant_kernel(
-    uint8_t* Bq, // [K, N]
-    half* _codebook, // [N / 4, ENTRY * RATIO]
-    half* B, // [K, N * RATIO]
-    int N, int K
+// each thread dequant an uint32_t and write back
+__global__ void awq_dequant_kernel(
+    const int32_t* __restrict__ qweight, // [K, N // 8]
+    const half* __restrict__ scales,     // [K // group_size, N]
+    const int32_t* __restrict__ qzeros,  // [K // group_size, N // 8]
+    half* __restrict__ w_decoded,        // [K, N]
+    int K, int N, int group_size
 )
 {    
-    extern __shared__ uint8_t shmem[];
-    uint8_t indice[4];
-    half* B_buf = reinterpret_cast<half*>(shmem);
-    // codebook size: [DQ_BLOCK_TILE_N / 4 (=32) ,ENTRY * RATIO] (RATIO = 2)
-    half* codebook_buf = reinterpret_cast<half*>(shmem + DQ_BLOCK_TILE_K * DQ_BLOCK_TILE_N * RATIO * 2);
-    uint32_t Brow = threadIdx.x % 32; // [0, 31]
-    uint32_t Bcol = (threadIdx.x / 32) * 4; // 4 * [0, 31]
-    // Load Codebook to shmem
+    constexpr int kColsPerPack = 8;
+    const int packs_per_row = DQ_BLOCK_TILE_N / kColsPerPack; // 16
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane_id = tid & 31;
 
-    uint32_t codebook_begin_row = blockIdx.y * DQ_BLOCK_TILE_N / 4;
-    // uint32_t iters_to_load = ((32 * ENTRY * RATIO) / 8) / BLOCK_SIZE; // = 2
-    uint32_t load_cols = (ENTRY * RATIO) / 8; // =64
-    uint32_t load_rows = DQ_BLOCK_SIZE / load_cols; // =16
+    const int row = blockIdx.x * DQ_BLOCK_TILE_K + warp_id * 2 + (lane_id / 16);
+    const int col_pack = blockIdx.y * packs_per_row + (lane_id % 16);
+    const int N_pack = N / kColsPerPack;
 
-    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n"
-    :
-    : "r"(shmem_uint32_t(&codebook_buf[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])),
-        "l"(&_codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
-    );
-    // *(int4*)(&codebook_buf[(threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
-    // *(int4*)(&_codebook[(codebook_begin_row + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
+    const int group_idx = row / group_size;
 
-    asm volatile ("cp.async.ca.shared.global [%0], [%1], 16;\n"
-    :
-    : "r"(shmem_uint32_t(&codebook_buf[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])),
-        "l"(&_codebook[(codebook_begin_row + load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8])
-    );
-    // *(int4*)(&codebook_buf[(load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]) = 
-    // *(int4*)(&_codebook[(codebook_begin_row + load_rows + threadIdx.x / load_cols) * (ENTRY * RATIO) + (threadIdx.x % load_cols) * 8]);
+    const uint32_t packed_weight = static_cast<uint32_t>(qweight[row * N_pack + col_pack]);
+    const uint32_t packed_zero = static_cast<uint32_t>(qzeros[group_idx * N_pack + col_pack]);
+    const int col_base = col_pack * 8;
 
-    asm volatile("cp.async.wait_all;\n"::);
-    __syncthreads();
+    const half* scale_tile = scales + group_idx * N + col_base;
+    alignas(16) half decoded_vals[kColsPerPack];
 
-    half* codebook_line = codebook_buf + (Bcol / 4) * ENTRY * RATIO;
-
-    // Load Bq indice to reg.
-    *(uint32_t*)(&indice[0]) = *(uint32_t*)(&Bq[(Brow + blockIdx.x * DQ_BLOCK_TILE_K) * N + blockIdx.y * DQ_BLOCK_TILE_N + Bcol]);
-
-    // dequant and write to HBM
-    *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 0) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[0]) * RATIO]);
-    *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 1) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[1]) * RATIO]);
-    *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 2) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[2]) * RATIO]);
-    *(uint32_t*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol + 3) * RATIO]) = *(uint32_t*)(&codebook_line[((uint32_t)indice[3]) * RATIO]);
-
-    // write back to HBM
-    *(int4*)(&B[(Brow + blockIdx.x * DQ_BLOCK_TILE_K) * N * RATIO + (blockIdx.y * DQ_BLOCK_TILE_N + Bcol) * RATIO]) = *(int4*)(&B_buf[(Brow * DQ_BLOCK_TILE_N + Bcol) * RATIO]);
+    #pragma unroll
+    for (int i = 0; i < kColsPerPack; ++i) {
+        const int nib_idx = i;
+        const float w = static_cast<float>((packed_weight >> (4 * nib_idx)) & 0xF);
+        const float z = static_cast<float>((packed_zero   >> (4 * nib_idx)) & 0xF);
+        const float s = __half2float(scale_tile[i]);
+        decoded_vals[i] = __float2half_rn((w - z) * s);
+    }
+    *(uint4*)(&w_decoded[row * N + col_base]) = *reinterpret_cast<uint4*>(decoded_vals);
 }
 
 torch::Tensor e2e_gemm(
     torch::Tensor input,
-    torch::Tensor w,
-    torch::Tensor codebook
+    torch::Tensor qweight,
+    torch::Tensor scales,
+    torch::Tensor qzeros,
+    int group_size
 )
 {
 #if PROFILING == 1
@@ -338,53 +315,56 @@ torch::Tensor e2e_gemm(
 
     auto M = input.size(0);
     auto K = input.size(1);
-    auto N = w.size(1);
+    auto N = qweight.size(1) * 8;
     std::cout << M << " " << K << " " << N << std::endl;
     auto options = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA, 0);
-    torch::Tensor o = torch::full({M, N * RATIO}, 0, options);
+    torch::Tensor o = torch::full({M, N}, 0, options);
 
     half* input_ptr = reinterpret_cast<half*>(input.data_ptr<at::Half>());
-
-    uint8_t* w_ptr = reinterpret_cast<uint8_t*>(w.data_ptr<uint8_t>());
-    half* codebook_ptr = reinterpret_cast<half*>(codebook.data_ptr<at::Half>());
+    const int32_t* qweight_ptr = reinterpret_cast<const int32_t*>(qweight.data_ptr<int32_t>());
+    const half* scales_ptr = reinterpret_cast<const half*>(scales.data_ptr<at::Half>());
+    const int32_t* qzeros_ptr = reinterpret_cast<const int32_t*>(qzeros.data_ptr<int32_t>());
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
-    torch::Tensor B = torch::full({K, N * RATIO}, 0, options);
+
+    torch::Tensor B = torch::full({K, N}, 0, options);
     half* B_ptr = reinterpret_cast<half*>(B.data_ptr<at::Half>());
 
-    dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
+    dim3 grid(M / BLOCK_TILE_M, N / BLOCK_TILE_N);
     dim3 block(BLOCK_SIZE); // = 128
     // For dequant kernel
-    dim3 dq_grid(K / DQ_BLOCK_TILE_K, N / DQ_BLOCK_TILE_N); // 4096 / 128 blocks. split on N
-    dim3 dq_block(DQ_BLOCK_SIZE); // = 1024
+    dim3 dq_grid(K / DQ_BLOCK_TILE_K, N / DQ_BLOCK_TILE_N);
+    dim3 dq_block(DQ_BLOCK_SIZE);
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
-        dequant_kernel<<<dq_grid, dq_block, DEQUANT_SHARED_MEMORY_USAGE>>>(
-            w_ptr,
-            codebook_ptr,
+        awq_dequant_kernel<<<dq_grid, dq_block, DEQUANT_SHARED_MEMORY_USAGE>>>(
+            qweight_ptr,
+            scales_ptr,
+            qzeros_ptr,
             B_ptr,
-            N, K
+            K, N, group_size
         );
         gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
             input_ptr, 
             B_ptr,
             o_ptr,
-            M, N * RATIO, K
+            M, N, K
         );
     }
     cudaEventRecord(st);
     for (int i = 0; i < iter; i++) {
 #endif
-        dequant_kernel<<<dq_grid, dq_block, DEQUANT_SHARED_MEMORY_USAGE>>>(
-            w_ptr,
-            codebook_ptr,
+        awq_dequant_kernel<<<dq_grid, dq_block, DEQUANT_SHARED_MEMORY_USAGE>>>(
+            qweight_ptr,
+            scales_ptr,
+            qzeros_ptr,
             B_ptr,
-            N, K
+            K, N, group_size
         );
         gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
             input_ptr, 
             B_ptr,
             o_ptr,
-            M, N * RATIO, K
+            M, N, K
         );
 #if PROFILING == 1
     }
@@ -393,7 +373,7 @@ torch::Tensor e2e_gemm(
     float ms;
     cudaEventElapsedTime(&ms, st, ed);
     std::cout << "Latency: " << ms / (1.0 * iter) << std::endl;
-    std::cout << "TFLOPS : " << ((2.0 * M * N * K * RATIO) / ((ms / (1.0 * iter)) / (1000.0))) / (1024.0 * 1024.0 * 1024.0 * 1024.0) << std::endl;
+    std::cout << "TFLOPS : " << ((2.0 * M * N * K) / ((ms / (1.0 * iter)) / (1000.0))) / (1024.0 * 1024.0 * 1024.0 * 1024.0) << std::endl;
 #endif
     return o;
 }

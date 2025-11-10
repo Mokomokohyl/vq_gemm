@@ -1,13 +1,9 @@
+import importlib
 import torch
 import numpy as np
 import os
 
 import vq_gemm_cuda_cublas_gemm
-import vq_gemm_cuda_s1
-import vq_gemm_cuda_s2_128
-import vq_gemm_cuda_s2_512
-import vq_gemm_cuda_s3_naive
-import vq_gemm_cuda_s3_wasp
 
 M = 2048
 K = 4096
@@ -17,78 +13,129 @@ run_vq_gemm = not (os.getenv('TEST_GEMM', 'FALSE') == 'TRUE')
 if not run_vq_gemm:
     M = N = K = 4096
 kernel_to_use_str = os.getenv('KERNELS', 'all')
-module_dict = {
-    "s1": vq_gemm_cuda_s1,
-    "s2_128": vq_gemm_cuda_s2_128,
-    "s2_512": vq_gemm_cuda_s2_512,
-    "s3_naive": vq_gemm_cuda_s3_naive,
-    "s3_wasp": vq_gemm_cuda_s3_wasp
-}
-module = module_dict[kernel_to_use_str]
-ENTRY = 256
-RATIO = 2
+module = importlib.import_module("vq_gemm_cuda_" + kernel_to_use_str)
 
 device = torch.device('cuda')
 torch.manual_seed(42)
 
-import torch
+_MATPLOTLIB = None
 
-def vq_gemm_reference(input, w, codebook):
-    # input: [M, K]
-    # w: [K, N]，每个元素为uint8
-    # codebook: [N // 2, ENTRY, RATIO]
-    K, N = w.shape
-    M = input.shape[0]
-    RATIO = codebook.shape[2]
 
-    # 计算每个列对应的分块行号
-    row_idx = torch.arange(N, device=w.device) // 4  # [N]
-    # 展开为 [K, N]，每个元素是分块行号
-    row_idx_expand = row_idx.unsqueeze(0).expand(K, N)
-    # entry_idx就是w本身
-    entry_idx = w.int()  # [K, N]
+def _ensure_matplotlib():
+    global _MATPLOTLIB
+    if _MATPLOTLIB is None:
+        _MATPLOTLIB = importlib.import_module("matplotlib.pyplot")
+    return _MATPLOTLIB
 
-    # 用高级索引一次性查码本，得到 [K, N, RATIO]
-    w_decoded = codebook[row_idx_expand, entry_idx]  # [K, N, RATIO]
-    # reshape为 [K, N * RATIO]
-    w_decoded = w_decoded.reshape(K, N * RATIO)
-    output = vq_gemm_cuda_cublas_gemm.gemm(input, w_decoded)
-    return output
+
+def awq_dequantize_torch(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    if group_size == -1:
+        group_size = qweight.shape[0]
+
+    bits = 4
+    shifts = torch.arange(0, 32, bits, device=qzeros.device)
+
+    iweights = torch.bitwise_right_shift(
+        qweight[:, :, None], shifts[None, None, :]
+    ).to(torch.int16)
+    iweights = iweights.reshape(qweight.shape[0], -1)
+
+    zeros = torch.bitwise_right_shift(
+        qzeros[:, :, None], shifts[None, None, :]
+    ).to(torch.int16)
+    zeros = zeros.reshape(qzeros.shape[0], -1)
+
+    mask = (1 << bits) - 1
+    iweights = torch.bitwise_and(iweights, mask)
+    zeros = torch.bitwise_and(zeros, mask)
+
+    scales = scales.repeat_interleave(group_size, dim=0)
+    zeros = zeros.repeat_interleave(group_size, dim=0)
+    return (iweights.to(scales.dtype) - zeros.to(scales.dtype)) * scales
+
+def vq_gemm_reference(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    w_decoded = awq_dequantize_torch(qweight, scales, qzeros, group_size)
+    return vq_gemm_cuda_cublas_gemm.gemm(input, w_decoded.to(input.dtype).contiguous())
 
 def gemm_ref(input, w):
     return vq_gemm_cuda_cublas_gemm.gemm(input, w)
 
+def _generate_awq_inputs(m: int, k: int, n: int, device: torch.device):
+    group_size = 128
+    if k % group_size != 0:
+        group_size = k
+    if n % 8 != 0:
+        raise ValueError("AWQ reference requires N to be divisible by 8.")
+    packed_cols = n // 8
+
+    input = torch.randn(m, k, dtype=torch.float16, device=device)
+    qweight = torch.randint(
+        0,
+        torch.iinfo(torch.int32).max,
+        (k, packed_cols),
+        dtype=torch.int32,
+        device=device,
+    )
+    qzeros = torch.randint(
+        0,
+        torch.iinfo(torch.int32).max,
+        (k // group_size, packed_cols),
+        dtype=torch.int32,
+        device=device,
+    )
+    scales = torch.rand(
+        (k // group_size, n), dtype=torch.float16, device=device
+    )
+    return input, qweight, scales, qzeros, group_size
+
 def main():
     if profiling:
-        print(f"Enter profiling code")
-        print(f"  M={M}, K={K}, N={N}, ENTRY={ENTRY}, RATIO={RATIO}")
+        print("Enter profiling code")
+        print(f"  M={M}, K={K}, N={N}")
         print(f"  Device: {device}")
         print("=" * 60)
-        input = torch.randn(M, K, dtype=torch.float16, device=device)
-        w = torch.randint(0, ENTRY, (K, N), dtype=torch.uint8, device=device)
-        codebook = torch.randn(N // 4, ENTRY, RATIO, dtype=torch.float16, device=device)
+        input, qweight, scales, qzeros, group_size = _generate_awq_inputs(
+            M, K, N, device
+        )
         torch.cuda.synchronize()
-        output_cuda = module.e2e_gemm(input, w, codebook)
+        output_ref = vq_gemm_reference(input, qweight, scales, qzeros, group_size)
+        torch.cuda.synchronize()
+        print(f"AWQ reference output mean: {output_ref.mean().item():.6f}")
         return
 
-    print(f"VQ GEMM Benchmark")
+    print("AWQ GEMM Benchmark")
     print(f"Using kernel VERSION={kernel_to_use_str}")
-    print(f"M={M}, K={K}, N={N}, ENTRY={ENTRY}, RATIO={RATIO}")
+    print(f"M={M}, K={K}, N={N}")
     print(f"Device: {device}")
     print("=" * 60)
 
     # 运行 VQ GEMM
     if run_vq_gemm:
-        input = torch.randn(M, K, dtype=torch.float16, device=device)
-        w = torch.randint(0, ENTRY, (K, N), dtype=torch.uint8, device=device)
-        codebook = torch.randn(N // 4, ENTRY, RATIO, dtype=torch.float16, device=device)
+        input, qweight, scales, qzeros, group_size = _generate_awq_inputs(
+            M, K, N, device
+        )
+        print(input.shape, input.dtype, input.is_contiguous())
+        print(qweight.shape, qweight.dtype, qweight.is_contiguous())
+        print(scales.shape, scales.dtype, scales.is_contiguous())
+        print(qzeros.shape, qzeros.dtype, qzeros.is_contiguous())
+        print(group_size)
+        print(module)
         torch.cuda.synchronize()
-
-        output_cuda = module.e2e_gemm(input, w, codebook)
-
+        output_ref = vq_gemm_reference(input, qweight, scales, qzeros, group_size)
         torch.cuda.synchronize()
-
-        output_ref = vq_gemm_reference(input, w, codebook)
+        output_cuda = module.e2e_gemm(input, qweight, scales, qzeros, group_size)
+        torch.cuda.synchronize()
 
         print(f"VQ GEMM output shape:{output_cuda.shape}")
         print("Row mean of VQ GEMM output (Reference):", output_ref.mean(dim=1))
@@ -106,8 +153,8 @@ def main():
         outs_cuda = []
         outs_ref = []
         for i in range(5):
-            outs_cuda.append(module.e2e_gemm(input, w, codebook).cpu())
-            outs_ref.append(vq_gemm_reference(input, w, codebook).cpu())
+            outs_cuda.append(module.e2e_gemm(input, qweight, scales, qzeros, group_size).cpu())
+            outs_ref.append(vq_gemm_reference(input, qweight, scales, qzeros, group_size).cpu())
 
         # 比较 CUDA 输出是否一致
         for i in range(1, 5):
@@ -136,6 +183,7 @@ def main():
         print(f"Max abs diff: {max_val.item()}, at ({max_row}, {max_col})")
 
         abs_diff_np = abs_diff.cpu().numpy()
+        plt = _ensure_matplotlib()
         plt.imshow(abs_diff_np, aspect='auto', cmap='viridis')
         plt.colorbar()
         plt.title("Absolute Error Heatmap")
