@@ -98,25 +98,27 @@ __device__ void loadFragA_mma(uint32_t* frag, half *shmem, int ki) {
 __device__ void loadFragB_mma(uint32_t* frag, half *shmem, int ki) {
     uint32_t warp_id_y = (threadIdx.x / WARP_SIZE) % 2;
     uint32_t lane_id = threadIdx.x % WARP_SIZE;
-    // for (int i = 0; i < 8; i++) {       // Warp do 16x64, 16x8 a time, so 8 times
-    //     for (int j = 0; j < 2; j++) {   // for every 16x8, every thread load 2 1x2 data
-    //         int row = ki * WARP_TILE_K + j * 8 + (lane_id / 4);
-    //         int col = warp_id_y * WARP_TILE_N + i * 8 + (lane_id % 4) * 2;
-    //         frag[i * 2 + j] = *(uint32_t*)(shmem + (row / WMMA_TILE_K) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_K * (WMMA_TILE_N)) + (col / WMMA_TILE_N) * (WMMA_TILE_K * (WMMA_TILE_N)) + (row % WMMA_TILE_K) * (WMMA_TILE_N) + col % (WMMA_TILE_N));
-    //     }
-    //     // Can directly use ldmatrix.trans
-    //     asm volatile ("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(frag[i * 2]) : "r"(frag[i * 2]));
-    //     asm volatile ("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n" : "=r"(frag[i * 2 + 1]) : "r"(frag[i * 2]));
-    // }
+    // 不使用 ldmatrix：按元素加载每个 16x8 子块的两个 8x8 子片，
+    // 再用 movmatrix 在寄存器内做 8x8 转置，满足 mma.sync.row.col 对 B 的列主布局要求。
+    // Warp 负责 16x64（分成 8 个 16x8 小块），每次每线程加载 2 组 1x2 half（j=0/1 对应 8 行偏移）。
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        int row = ki * WARP_TILE_K + (lane_id % 16);
-        int col = warp_id_y * WARP_TILE_N + i * 16 + (lane_id / 16) * 8;
-        asm volatile (
-            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-            : "=r"(frag[i * 4]), "=r"(frag[i * 4 + 1]), "=r"(frag[i * 4 + 2]), "=r"(frag[i * 4 + 3])
-            : "r"(shmem_uint32_t(shmem + (row / WMMA_TILE_K) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_K * (WMMA_TILE_N)) + (col / WMMA_TILE_N) * (WMMA_TILE_K * (WMMA_TILE_N)) + (row % WMMA_TILE_K) * (WMMA_TILE_N) + col % (WMMA_TILE_N)))
-        );
+    for (int i = 0; i < 8; i++) {       // 8 个 16x8 小块横向遍历
+        for (int j = 0; j < 2; j++) {   // 将 16 行拆成两个 8x8（j 决定 +0 或 +8 行偏移）
+            int row = ki * WARP_TILE_K + j * 8 + (lane_id / 4);
+            int col = warp_id_y * WARP_TILE_N + i * 8 + (lane_id % 4) * 2;
+
+            uint32_t val = *(uint32_t*)(
+                shmem +
+                (row / WMMA_TILE_K) * ((BLOCK_TILE_N / WMMA_TILE_N) * WMMA_TILE_K * WMMA_TILE_N) +
+                (col / WMMA_TILE_N) * (WMMA_TILE_K * WMMA_TILE_N) +
+                (row % WMMA_TILE_K) * WMMA_TILE_N +
+                (col % WMMA_TILE_N)
+            );
+
+            // 将按行的 1x2 打包数据就地转置到 mma B 片段需要的列主布局
+            asm volatile ("movmatrix.sync.aligned.m8n8.trans.b16 %0, %0;\n" : "+r"(val));
+            frag[i * 2 + j] = val;
+        }
     }
 }
 
@@ -246,8 +248,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
     half *B[2];
     B[0] = reinterpret_cast<half*>(shmem);
     B[1] = reinterpret_cast<half*>(shmem + BLOCK_TILE_K * BLOCK_TILE_N * sizeof(half));
-    volatile int* B_ready[2];
-    volatile int* B_consumed[2];
+    int* B_ready[2];
+    int* B_consumed[2];
     B_ready[0]    = &bs_locks[0];
     B_ready[1]    = &bs_locks[1];
     B_consumed[0] = &bs_locks[2];
@@ -260,32 +262,32 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
 
     dequantToShmemB(B[0], _w, _codebook, codebook_buf, K, N, 0);
     if (tid == 0) {
-        *B_ready[0] = 1;
+        __threadfence_block();
+        atomicExch(B_ready[0], 1);
     }
     dequantToShmemB(B[1], _w, _codebook, codebook_buf, K, N, 1);
     if (tid == 0) {
-        *B_ready[1] = 1;
+        __threadfence_block();
+        atomicExch(B_ready[1], 1);
     }
     __syncthreads();
 
-    if (tid == 0) {
-        printf("#3 control reached here by dequant block %d\n", cluster_block_id);
-    }
-    __syncthreads();
     for (int ko = 2; ko < K / BLOCK_TILE_K; ko++) {
+        if (tid == 0) { printf("ko = %d\n", ko); }
+        __syncthreads();
         // wait for B[ko % 2] consumed by all GeMM blocks
-        printf("#4 control reached here by dequant block %d\n", cluster_block_id);
-        while (*B_consumed[ko % 2] != CLUSTER_SIZE - 1) { __nanosleep(32); } 
-        // Set lock and consume counter
+        while (atomicAdd(B_consumed[ko % 2], 0) < CLUSTER_SIZE - 1) { __nanosleep(32); }
+        // Reset ready flag and consume counter before reuse
         if (tid == 0) {
-            *B_ready[ko % 2] = 0;
-            *B_consumed[ko % 2] = 0;
+            atomicExch(B_ready[ko % 2], 0);
+            atomicExch(B_consumed[ko % 2], 0);
         }
         dequantToShmemB(B[ko % 2], _w, _codebook, codebook_buf, K, N, ko);
         __syncthreads();
         // release lock
         if (tid == 0) {
-            *B_ready[ko % 2] = 1;
+            __threadfence_block();
+            atomicExch(B_ready[ko % 2], 1);
         }
     }
 // end:   dequant block
@@ -299,7 +301,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
     B[0] = reinterpret_cast<half*>(cluster.map_shared_rank(shmem, CLUSTER_SIZE - 1));
     B[1] = reinterpret_cast<half*>(cluster.map_shared_rank(shmem + BLOCK_TILE_K * BLOCK_TILE_N * sizeof(half), CLUSTER_SIZE - 1));
     // B buffer locks
-    volatile int* B_ready[2];
+    int* B_ready[2];
     int* B_consumed[2];
     B_ready[0]    = cluster.map_shared_rank(&bs_locks[0], CLUSTER_SIZE - 1);
     B_ready[1]    = cluster.map_shared_rank(&bs_locks[1], CLUSTER_SIZE - 1);
@@ -309,23 +311,14 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
     uint32_t A_frags[16];
     uint32_t B_frags[16];
     uint32_t C_frags[64] = {0};
-    if (tid == 0) {
-        printf("#1 control reached here by gemm block %d\n", cluster_block_id);
-    }
 
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
         loadShmemA(A1, _input, M, K, ko);
         asm volatile("cp.async.wait_all;\n"::);
-        while (*(B_ready[ko % 2]) != 1) { __nanosleep(32); } // wait for B[ko % 2] filled
-        if (tid == 0) { printf("#2: control reached here by gemm block %d\n", cluster_block_id); }
-        __syncthreads();
-        if (tid == 0) { printf("#3: control reached here by gemm block %d\n", cluster_block_id); }
+    while (atomicAdd(B_ready[ko % 2], 0) != 1) { __nanosleep(32); } // wait for B[ko % 2] filled
         for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
-            if (tid == 0) { printf("#4: control reached here by gemm block %d\n", cluster_block_id); }
             loadFragA_mma(A_frags, A1, ki);
-            if (tid == 0) { printf("#5: control reached here by gemm block %d\n", cluster_block_id); }
             loadFragB_mma(B_frags, B[ko % 2], ki);
-            if (tid == 0) { printf("#6: control reached here by gemm block %d\n", cluster_block_id); }
             // dequantToRegB(B_frags, _w, _codebook, codebook_buf, K, N, ko, ki);
             for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
                 for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
@@ -333,12 +326,13 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
                 }
             }
         }
-        if (tid == 0) { atomicAdd(B_consumed[ko % 2], 1); } // current GeMM block consumed B[ko % 2], signal the dequant block.
+    if (tid == 0) { atomicAdd(B_consumed[ko % 2], 1); } // current GeMM block consumed B[ko % 2], signal the dequant block.
         __syncthreads();
     }
     storeC(_o, C_frags, M, N * RATIO);    
 // end:   GeMM block
     }
+
     cluster.sync();
 }
 
