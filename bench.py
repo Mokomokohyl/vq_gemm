@@ -10,7 +10,7 @@ import vq_gemm_cuda_s3_naive
 import vq_gemm_cuda_s3_wasp
 import vq_gemm_cuda_s3_bs
 
-M = 2048
+M = 1920
 K = 4096
 N = 640
 profiling = (os.getenv('PROFILING', 'FALSE') == 'TRUE')

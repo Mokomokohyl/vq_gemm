@@ -9,6 +9,8 @@
 #include "mma.h"
 #include <random>
 
+namespace cg = cooperative_groups;
+
 #define PROFILING 1
 #define WARP_NUM 4
 #define WARP_SIZE 32
@@ -185,7 +187,11 @@ __device__ void dequantToShmemB(half* shmem, uint8_t* B_q, half* codebook, half*
     *(uint64_t*)(&indices[8]) = *(uint64_t*)(&B_q[(ko * BLOCK_TILE_K) * n + blockIdx.y * (BLOCK_TILE_N / RATIO) + (threadIdx.x / 4) * n + (threadIdx.x % 4) * 16 + 8]);
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        *(uint32_t*)(&shmem[(threadIdx.x / 64) * (8 * 16 * 16) + (threadIdx.x % 4 * 16 + i) * 2 / 16 * (16 * 16) + (threadIdx.x / 4) % 16 * 16 + (threadIdx.x % 4 * 8 + i) * 2 % 16]) = *(uint32_t*)(&codebook_shmem[(local_id + i / 4) * 256 * RATIO + ((uint32_t) indices[i]) * RATIO]);
+        *(uint32_t*)(&shmem[(threadIdx.x / 64)                  * (8 * 16 * 16) + 
+                            (threadIdx.x % 4 * 16 + i) * 2 / 16 * (16 * 16) + 
+                            (threadIdx.x / 4)              % 16 * 16 + 
+                            (threadIdx.x % 4 * 8 + i) * 2       % 16]) 
+        = *(uint32_t*)(&codebook_shmem[(local_id + i / 4) * 256 * RATIO + ((uint32_t) indices[i]) * RATIO]);
     }
 }
 
@@ -210,7 +216,8 @@ __device__ void load_codebook(
     }
 }
 
-__global__ void e2e_gemm_kernel(
+template<const int CLUSTER_SIZE>
+__global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
     half* _input,
     uint8_t* _w,
     half* _codebook,
@@ -218,28 +225,107 @@ __global__ void e2e_gemm_kernel(
     int M, int N, int K
 )
 {
-    extern __shared__ uint8_t shmem[];
-    half *A1 = reinterpret_cast<half*>(shmem);
-    half *B1 = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
-    half *codebook_buf = reinterpret_cast<half*>(shmem + (BLOCK_TILE_M * BLOCK_TILE_K + BLOCK_TILE_K * BLOCK_TILE_N) * sizeof(half));
+    cg::cluster_group cluster       = cg::this_cluster();
+    const uint32_t cluster_block_id = cluster.block_rank();
+    const uint32_t tid = threadIdx.x;
 
-    uint32_t A_frags[16];
-    uint32_t B_frags[16];
-    uint32_t C_frags[64] = {0};
+    /* init block specialization locks */
+    __shared__ int bs_locks[4];
+    if (tid == 0) {
+        for (int i = 0; i < 4; i++) {
+            bs_locks[i] = 0;
+        }
+    }
+    cluster.sync();
 
+    /* block specialization begin */
+    if (cluster_block_id == CLUSTER_SIZE - 1) {
+// begin: dequant block
     // Load codebook
+    extern __shared__ uint8_t shmem[];
+    half *B[2];
+    B[0] = reinterpret_cast<half*>(shmem);
+    B[1] = reinterpret_cast<half*>(shmem + BLOCK_TILE_K * BLOCK_TILE_N * sizeof(half));
+    volatile int* B_ready[2];
+    volatile int* B_consumed[2];
+    B_ready[0]    = &bs_locks[0];
+    B_ready[1]    = &bs_locks[1];
+    B_consumed[0] = &bs_locks[2];
+    B_consumed[1] = &bs_locks[3];
+
+    half *codebook_buf = reinterpret_cast<half*>(shmem + (2 * BLOCK_TILE_K * BLOCK_TILE_N) * sizeof(half));
     load_codebook(codebook_buf, _codebook);
     asm volatile("cp.async.wait_all;\n"::);
     __syncthreads();
 
+    dequantToShmemB(B[0], _w, _codebook, codebook_buf, K, N, 0);
+    if (tid == 0) {
+        *B_ready[0] = 1;
+    }
+    dequantToShmemB(B[1], _w, _codebook, codebook_buf, K, N, 1);
+    if (tid == 0) {
+        *B_ready[1] = 1;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        printf("#3 control reached here by dequant block %d\n", cluster_block_id);
+    }
+    __syncthreads();
+    for (int ko = 2; ko < K / BLOCK_TILE_K; ko++) {
+        // wait for B[ko % 2] consumed by all GeMM blocks
+        printf("#4 control reached here by dequant block %d\n", cluster_block_id);
+        while (*B_consumed[ko % 2] != CLUSTER_SIZE - 1) { __nanosleep(32); } 
+        // Set lock and consume counter
+        if (tid == 0) {
+            *B_ready[ko % 2] = 0;
+            *B_consumed[ko % 2] = 0;
+        }
+        dequantToShmemB(B[ko % 2], _w, _codebook, codebook_buf, K, N, ko);
+        __syncthreads();
+        // release lock
+        if (tid == 0) {
+            *B_ready[ko % 2] = 1;
+        }
+    }
+// end:   dequant block
+    } else {
+// begin: GeMM blcoks
+    extern __shared__ uint8_t shmem[];
+    half *A1 = reinterpret_cast<half*>(shmem); // BLOCK_TILE_M * BLOCK_TILE_K
+    // get remote addresses in dequant block
+    // B Buffer
+    half* B[2];
+    B[0] = reinterpret_cast<half*>(cluster.map_shared_rank(shmem, CLUSTER_SIZE - 1));
+    B[1] = reinterpret_cast<half*>(cluster.map_shared_rank(shmem + BLOCK_TILE_K * BLOCK_TILE_N * sizeof(half), CLUSTER_SIZE - 1));
+    // B buffer locks
+    volatile int* B_ready[2];
+    int* B_consumed[2];
+    B_ready[0]    = cluster.map_shared_rank(&bs_locks[0], CLUSTER_SIZE - 1);
+    B_ready[1]    = cluster.map_shared_rank(&bs_locks[1], CLUSTER_SIZE - 1);
+    B_consumed[0] = cluster.map_shared_rank(&bs_locks[2], CLUSTER_SIZE - 1);
+    B_consumed[1] = cluster.map_shared_rank(&bs_locks[3], CLUSTER_SIZE - 1);
+
+    uint32_t A_frags[16];
+    uint32_t B_frags[16];
+    uint32_t C_frags[64] = {0};
+    if (tid == 0) {
+        printf("#1 control reached here by gemm block %d\n", cluster_block_id);
+    }
+
     for (int ko = 0; ko < K / BLOCK_TILE_K; ko++) {
         loadShmemA(A1, _input, M, K, ko);
-        dequantToShmemB(B1, _w, _codebook, codebook_buf, K, N, ko);
         asm volatile("cp.async.wait_all;\n"::);
+        while (*(B_ready[ko % 2]) != 1) { __nanosleep(32); } // wait for B[ko % 2] filled
+        if (tid == 0) { printf("#2: control reached here by gemm block %d\n", cluster_block_id); }
         __syncthreads();
+        if (tid == 0) { printf("#3: control reached here by gemm block %d\n", cluster_block_id); }
         for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
+            if (tid == 0) { printf("#4: control reached here by gemm block %d\n", cluster_block_id); }
             loadFragA_mma(A_frags, A1, ki);
-            loadFragB_mma(B_frags, B1, ki);
+            if (tid == 0) { printf("#5: control reached here by gemm block %d\n", cluster_block_id); }
+            loadFragB_mma(B_frags, B[ko % 2], ki);
+            if (tid == 0) { printf("#6: control reached here by gemm block %d\n", cluster_block_id); }
             // dequantToRegB(B_frags, _w, _codebook, codebook_buf, K, N, ko, ki);
             for (int mm = 0; mm < WARP_TILE_M / WMMA_TILE_M; mm++) {
                 for (int nn = 0; nn < WARP_TILE_N / WMMA_TILE_N; nn++) {
@@ -247,9 +333,13 @@ __global__ void e2e_gemm_kernel(
                 }
             }
         }
+        if (tid == 0) { atomicAdd(B_consumed[ko % 2], 1); } // current GeMM block consumed B[ko % 2], signal the dequant block.
         __syncthreads();
     }
     storeC(_o, C_frags, M, N * RATIO);    
+// end:   GeMM block
+    }
+    cluster.sync();
 }
 
 torch::Tensor e2e_gemm(
@@ -265,7 +355,6 @@ torch::Tensor e2e_gemm(
     cudaEventCreate(&st);
     cudaEventCreate(&ed);
 #endif
-    cudaFuncSetAttribute(e2e_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
     // Assuming M is padded to 128, pad at torch level.
 
     auto M = input.size(0);
@@ -281,11 +370,15 @@ torch::Tensor e2e_gemm(
     half* codebook_ptr = reinterpret_cast<half*>(codebook.data_ptr<at::Half>());
     half* o_ptr = reinterpret_cast<half*>(o.data_ptr<at::Half>());
 
-    dim3 grid(M / BLOCK_TILE_M, N / (BLOCK_TILE_N / RATIO));
+    const int CLUSTER_SIZE = 16;
+    printf("CLUSTER_SIZE: %d, grid:(%d, %d)", CLUSTER_SIZE, CLUSTER_SIZE, N * RATIO / BLOCK_TILE_N);
+    dim3 grid(CLUSTER_SIZE, N * RATIO / BLOCK_TILE_N);
     dim3 block(BLOCK_SIZE);
+    cudaFuncSetAttribute(e2e_gemm_kernel<CLUSTER_SIZE>, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SHARED_MEMORY_USAGE);
+    cudaFuncSetAttribute(e2e_gemm_kernel<CLUSTER_SIZE>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
-        e2e_gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
+        e2e_gemm_kernel<CLUSTER_SIZE><<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
             input_ptr, 
             w_ptr,
             codebook_ptr, 
@@ -296,7 +389,7 @@ torch::Tensor e2e_gemm(
     cudaEventRecord(st);
     for (int i = 0; i < iter; i++) {
 #endif
-        e2e_gemm_kernel<<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
+        e2e_gemm_kernel<CLUSTER_SIZE><<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
             input_ptr, 
             w_ptr,
             codebook_ptr, 
