@@ -58,6 +58,7 @@ prof-s2-128:;$(MAKE) profile KERNELS=s2_128
 prof-s2-512:;$(MAKE) profile KERNELS=s2_512
 prof-s3-naive:;$(MAKE) profile KERNELS=s3_naive
 prof-s3-wasp:;$(MAKE) profile KERNELS=s3_wasp
+prof-s3-bs:;$(MAKE) profile KERNELS=s3_bs
 
 run-gemm-128:; TEST_GEMM=TRUE KERNELS=s1 python bench.py > ./logs/bench_gemm_128.log 2>&1
 run-gemm-s2:; TEST_GEMM=TRUE KERNELS=s2_128 python bench.py > ./logs/bench_gemm_128.log 2>&1

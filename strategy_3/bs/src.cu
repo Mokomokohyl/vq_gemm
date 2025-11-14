@@ -52,6 +52,16 @@ __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     return addr;
 }
 
+template<uint32_t RegCount>
+__device__ __forceinline__ void warpgroup_reg_alloc(){
+  asm volatile( "setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount) );
+}
+
+template<uint32_t RegCount>
+__device__ __forceinline__ void warpgroup_reg_dealloc(){
+  asm volatile( "setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount) );
+}
+
 __device__ void loadShmemA(half* shmem, half *A, int m, int k, int ko) {
     for (int i = 0; i < ((BLOCK_TILE_M * BLOCK_TILE_K) / BLOCK_SIZE) / 8; i++) {
         int row = i * 32 + threadIdx.x / 4;
@@ -226,8 +236,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
     half* _o,
     int M, int N, int K,
     int* _ready,    // global ready flags: 2 per y-group (double buffer), value = generation
-    int* _consumed, // global consumed counters: 2 per y-group (cumulative)
-    int* _errors    // global error code per y-group (0 ok, 1 prod-timeout, 2 cons-timeout)
+    int* _consumed  // global consumed counters: 2 per y-group (cumulative)
 )
 {
     cg::cluster_group cluster       = cg::this_cluster();
@@ -238,12 +247,25 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
     const int group_id = blockIdx.y; // one 2-slot lock per y-group
     int* B_ready[2];
     int* B_consumed[2];
-    int* B_errors = _errors ? &_errors[group_id] : nullptr;
     // Two slots per group for double buffering
     B_ready[0]    = _ready    ? &_ready[group_id * 2 + 0]    : nullptr;
     B_ready[1]    = _ready    ? &_ready[group_id * 2 + 1]    : nullptr;
     B_consumed[0] = _consumed ? &_consumed[group_id * 2 + 0] : nullptr;
     B_consumed[1] = _consumed ? &_consumed[group_id * 2 + 1] : nullptr;
+    // Volatile aliases for lock reads (avoid atomicAdd(...,0) for polling)
+    volatile int* V_ready[2];
+    volatile int* V_consumed[2];
+    V_ready[0]    = (volatile int*)B_ready[0];
+    V_ready[1]    = (volatile int*)B_ready[1];
+    V_consumed[0] = (volatile int*)B_consumed[0];
+    V_consumed[1] = (volatile int*)B_consumed[1];
+    // Initialize global lock arrays once per y-group inside kernel
+    if (cluster_block_id == 0 && tid == 0) {
+        if (B_ready[0])    *B_ready[0] = -1;
+        if (B_ready[1])    *B_ready[1] = -1;
+        if (B_consumed[0]) *B_consumed[0] = 0;
+        if (B_consumed[1]) *B_consumed[1] = 0;
+    }
     cluster.sync();
 
     /* block specialization begin */
@@ -264,41 +286,30 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
     // Publish initial two generations (g=0,1) without waiting
     dequantToShmemB(B[0], _w, _codebook, codebook_buf, K, N, 0);
     if (tid == 0) {
-        __threadfence_system();
         atomicExch(B_ready[0], 0); // gen = 0 on idx 0
         // printf("[PROD y=%d] publish buf0 gen=0\n", group_id);
     }
     dequantToShmemB(B[1], _w, _codebook, codebook_buf, K, N, 1);
     if (tid == 0) {
-        __threadfence_system();
         atomicExch(B_ready[1], 1); // gen = 1 on idx 1
         // printf("[PROD y=%d] publish buf1 gen=1\n", group_id);
     }
     __syncthreads();
 
     for (int ko = 2; ko < K / BLOCK_TILE_K; ko++) {
-        __syncthreads();
         // Double buffer index for this ko
         int idx = ko & 1;
         // Before reusing buffer idx, producer waits for cumulative consumption of previous reuse
-        if (ko >= 2) {
-            int target_prev = (ko / 2) * (CLUSTER_SIZE - 1);
-            if (tid == 0) {
-                unsigned long long spins = 0ull;
-                while (atomicAdd(B_consumed[idx], 0) < target_prev) {
-                    __nanosleep(64);
-                    if (++spins > (1ull << 32)) {
-                        if (B_errors) atomicExch(B_errors, 1);
-                        break;
-                    }
-                }
+        int target_prev = (ko / 2) * (CLUSTER_SIZE - 1);
+        if (tid == 0) {
+            while ((*V_consumed[idx]) < target_prev) {
+                __nanosleep(32);
             }
-            __syncthreads();
         }
+        __syncthreads();
 
         // Fill and publish generation ko on buffer idx
         dequantToShmemB(B[idx], _w, _codebook, codebook_buf, K, N, ko);
-        __syncthreads();
         if (tid == 0) {
             atomicExch(B_ready[idx], ko); // publish exact generation
         }
@@ -323,7 +334,10 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
         loadShmemA(A1, _input, M, K, ko);
         asm volatile("cp.async.wait_all;\n"::);
         // Wait for exact generation on buffer idx
-        while (atomicAdd(B_ready[ko % 2], 0) != ko) { __nanosleep(64); }
+        if (tid == 0) {
+            while ((*V_ready[ko % 2]) != ko) { __nanosleep(32); }
+        }
+        __syncthreads();
         for (int ki = 0; ki < BLOCK_TILE_K / WARP_TILE_K; ki++) {
             loadFragA_mma(A_frags, A1, ki);
             loadFragB_mma(B_frags, B[ko % 2], ki);
@@ -334,7 +348,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
                 }
             }
         }
-        if (tid == 0) { __threadfence_system(); atomicAdd(B_consumed[ko % 2], 1); } // signal consumption
+        if (tid == 0) { atomicAdd(B_consumed[ko % 2], 1); } // signal consumption
         __syncthreads();
     }
     storeC(_o, C_frags, M, N * RATIO);    
@@ -382,38 +396,30 @@ torch::Tensor e2e_gemm(
     // Allocate global lock arrays: 2 slots per y-group (double buffering)
     int groups = grid.y;
     int lock_slots = groups * 2;
-    int *d_ready = nullptr, *d_consumed = nullptr, *d_errors = nullptr;
+    int *d_ready = nullptr, *d_consumed = nullptr;
     cudaMalloc(&d_ready,    lock_slots * sizeof(int));
     cudaMalloc(&d_consumed, lock_slots * sizeof(int));
-    cudaMalloc(&d_errors,   groups * sizeof(int));
 #if PROFILING == 1
     for (int i = 0; i < wmup; i++) {
-        // Initialize locks for each launch
-        cudaMemset(d_ready,    0xFF, lock_slots * sizeof(int)); // -1 for ready
-        cudaMemset(d_consumed, 0x00, lock_slots * sizeof(int));
-        cudaMemset(d_errors,   0x00, groups * sizeof(int));
         e2e_gemm_kernel<CLUSTER_SIZE><<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
             input_ptr, 
             w_ptr,
             codebook_ptr, 
             o_ptr,
             M, N, K,
-            d_ready, d_consumed, d_errors
+            d_ready, d_consumed
         );
     }
     cudaEventRecord(st);
     for (int i = 0; i < iter; i++) {
 #endif
-        cudaMemset(d_ready,    0xFF, lock_slots * sizeof(int));
-        cudaMemset(d_consumed, 0x00, lock_slots * sizeof(int));
-        cudaMemset(d_errors,   0x00, groups * sizeof(int));
         e2e_gemm_kernel<CLUSTER_SIZE><<<grid, block, MAX_SHARED_MEMORY_USAGE>>>(
             input_ptr, 
             w_ptr,
             codebook_ptr, 
             o_ptr,
             M, N, K,
-            d_ready, d_consumed, d_errors
+            d_ready, d_consumed
         );
 #if PROFILING == 1
     }
@@ -427,7 +433,6 @@ torch::Tensor e2e_gemm(
     // Optionally, could copy back errors for debugging; omitted to keep interface clean
     cudaFree(d_ready);
     cudaFree(d_consumed);
-    cudaFree(d_errors);
     return o;
 }
 
