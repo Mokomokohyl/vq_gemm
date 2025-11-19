@@ -39,7 +39,7 @@ namespace cg = cooperative_groups;
 #define CODEBOOK_BUFFERING 1
 
 // A + B = 16384, Codebook: (128 / 8) * 256 * 4 * 2 = 32768
-#define MAX_SHARED_MEMORY_USAGE (16384 * 2 + CODEBOOK_BUFFERING * (32768 / HOT))
+#define MAX_SHARED_MEMORY_USAGE (2 * BLOCK_TILE_N * BLOCK_TILE_K * sizeof(half) + (128 / 8 * 256 * 4 * 2))
 __device__ __forceinline__ uint32_t shmem_uint32_t(const void* shmem_ptr) {
     uint32_t addr;
     asm volatile(
