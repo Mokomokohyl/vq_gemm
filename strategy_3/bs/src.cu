@@ -324,7 +324,9 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) e2e_gemm_kernel(
     half* B[2];
     B[0] = reinterpret_cast<half*>(cluster.map_shared_rank(shmem, CLUSTER_SIZE - 1));
     B[1] = reinterpret_cast<half*>(cluster.map_shared_rank(shmem + BLOCK_TILE_K * BLOCK_TILE_N * sizeof(half), CLUSTER_SIZE - 1));
-    // B_ready / B_consumed already set to global pointers above
+    // If use local buffer as below, only 83.13 TFLOPS
+    // B[0] = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half));
+    // B[1] = reinterpret_cast<half*>(shmem + BLOCK_TILE_M * BLOCK_TILE_K * sizeof(half) + BLOCK_TILE_K * BLOCK_TILE_N * sizeof(half));
 
     uint32_t A_frags[16];
     uint32_t B_frags[16];
